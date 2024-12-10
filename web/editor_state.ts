@@ -2,10 +2,12 @@ import customMarkdownStyle from "./style.ts";
 import {
   history,
   indentWithTab,
+  insertNewlineAndIndent,
   isolateHistory,
   standardKeymap,
 } from "@codemirror/commands";
 import {
+  acceptCompletion,
   autocompletion,
   closeBrackets,
   closeBracketsKeymap,
@@ -367,8 +369,20 @@ export function createKeyBindings(client: Client): Extension {
     ...createCommandKeyBindings(client),
     ...createSmartQuoteKeyBindings(client),
     ...closeBracketsKeymap,
-    ...standardKeymap,
+    ...client.ui.viewState.uiOptions.vimMode
+      ? [
+        // Workaround for https://github.com/replit/codemirror-vim/issues/182;
+        // without this, Enter does nothing for ordinary paragraphs in insert
+        // mode.
+        {
+          key: "Enter",
+          run: insertNewlineAndIndent,
+          shift: insertNewlineAndIndent,
+        },
+      ]
+      : standardKeymap,
     ...completionKeymap,
+    { key: "Tab", run: acceptCompletion },
     indentWithTab,
   ]);
 }

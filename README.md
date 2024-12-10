@@ -25,7 +25,7 @@ SilverBullet...
 * Provides a platform for [end-user programming](https://www.inkandswitch.com/end-user-programming/) through its support for Objects, Live Queries and Live Templates.
 * Robust extension mechanism using [plugs](https://silverbullet.md/Plugs).
 * **Self-hosted**: you own your data. All content is stored as plain files in a folder on disk. Back up, sync, edit, publish, script with any additional tools you like.
-* SilverBullet is [open source, MIT licensed](https://github.com/silverbulletmd/silverbullet) software.
+* SilverBullet is [open source, MIT licensed](https://opensource.org/license/MIT) software.
 
 ## Installing SilverBullet
 Check out the [instructions](https://silverbullet.md/Install).
@@ -38,7 +38,7 @@ SilverBullet is written in [TypeScript](https://www.typescriptlang.org/) and
 built on top of the excellent [CodeMirror 6](https://codemirror.net/) editor
 component. Additional UI is built using [Preact](https://preactjs.com).
 [ESBuild]([https://parceljs.org/](https://esbuild.github.io)) is used to build both the front-end and
-back-end bundles. The server backend runs as a HTTP server on Deno using and is written using [Oak](https://oakserver.github.io/oak/).
+back-end bundles. The server backend runs as a HTTP server on Deno using and is written using [Hono](https://hono.dev).
 
 To prepare the initial web and plug build run:
 
