@@ -3,3 +3,6 @@ rules:
   - base: main
     upstream: silverbulletmd:main
     mergeMethod: hardreset
+  - base: pull
+    upstream: silverbulletmd:main
+    mergeMethod: merge
