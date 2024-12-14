@@ -577,22 +577,20 @@ const NakedURL = regexParser(
   {
     firstCharCode: 104, // h
     regex:
-      /^https?:\/\/[-a-zA-Z0-9@:%._\+~#=,;]{1,256}([-a-zA-Z0-9()@:%_\+.,;~#?&=\/]*)/,
+      /(^https?:\/\/([-a-zA-Z0-9@:%_\+~#=]|(?:[.](?!(\s|$)))){1,256})(([-a-zA-Z0-9(@:%_\+~#?&=\/]|(?:[.,:;)](?!(\s|$))))*)/,
     nodeType: "NakedURL",
     className: "sb-naked-url",
     tag: NakedURLTag,
   },
 );
 
-const Hashtag = regexParser(
-  {
-    firstCharCode: 35, // #
-    regex: new RegExp(`^${tagRegex.source}`),
-    nodeType: "Hashtag",
-    className: "sb-hashtag",
-    tag: ct.HashtagTag,
-  },
-);
+const Hashtag = regexParser({
+  firstCharCode: 35, // #
+  regex: new RegExp(`^${tagRegex.source}`),
+  nodeType: "Hashtag",
+  className: "sb-hashtag-text",
+  tag: ct.HashtagTag,
+});
 
 const TaskDeadline = regexParser({
   firstCharCode: 55357, // 📅
