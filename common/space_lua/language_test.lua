@@ -75,6 +75,17 @@ do
 end
 assert(a == 1)
 
+-- Async function calling
+function multiplier(a)
+    -- Anything will be async in practice
+    return function(b)
+        return a * b
+    end
+end
+
+local multiplier = multiplier(2)
+assert(multiplier(3) == 6)
+
 -- Function definitions in tables
 ns = { name = "Pete" }
 function ns.returnOne()
@@ -275,6 +286,63 @@ assert(string.rep("Hello", 3) == "HelloHelloHello")
 assert(string.sub("Hello", 2, 4) == "ell")
 assert(string.upper("Hello") == "HELLO")
 assert(string.lower("Hello") == "hello")
+
+-- Test string.gsub with various replacement types
+-- Simple string replacement
+local result, count = string.gsub("hello world", "hello", "hi")
+assert(result == "hi world", "Basic string replacement failed")
+assert(count == 1, "Basic replacement count failed")
+
+-- Multiple replacements
+result, count = string.gsub("hello hello hello", "hello", "hi")
+assert(result == "hi hi hi", "Multiple replacements failed")
+assert(count == 3, "Multiple replacement count failed")
+
+-- Limited replacements with n parameter
+result, count = string.gsub("hello hello hello", "hello", "hi", 2)
+assert(result == "hi hi hello", "Limited replacements failed")
+assert(count == 2, "Limited replacement count failed")
+
+-- Function replacement without captures
+result = string.gsub("hello world", "hello", function(match)
+    assert(match == "hello", "Function received incorrect match")
+    return string.upper(match)
+end)
+assert(result == "HELLO world", "Function replacement without captures failed")
+
+-- Function replacement with single capture
+result = string.gsub("hello world", "(h)ello", function(h)
+    assert(h == "h", "Function received incorrect capture")
+    return string.upper(h) .. "i"
+end)
+assert(result == "Hi world", "Function replacement with single capture failed")
+
+-- Function replacement with multiple captures
+result = string.gsub("hello world", "(h)(e)(l)(l)o", function(h, e, l1, l2)
+    assert(h == "h" and e == "e" and l1 == "l" and l2 == "l",
+        "Function received incorrect captures: " .. h .. ", " .. e .. ", " .. l1 .. ", " .. l2)
+    return string.upper(h) .. string.upper(e) .. l1 .. l2 .. "o"
+end)
+assert(result == "HEllo world", "Function replacement with multiple captures failed")
+
+-- Function returning nil (should keep original match)
+result = string.gsub("hello world", "hello", function() return nil end)
+assert(result == "hello world", "Function returning nil failed")
+
+-- Pattern with multiple matches on same position
+result = string.gsub("hello world", "h?e", "X")
+assert(result == "Xllo world", "Overlapping matches failed")
+
+-- Empty captures
+result = string.gsub("hello", "(h()e)", function(full, empty)
+    assert(full == "he" and empty == "", "Empty capture handling failed")
+    return "XX"
+end)
+assert(result == "XXllo", "Empty capture replacement failed")
+
+-- Patterns with magic characters
+result = string.gsub("hello.world", "%.", "-")
+assert(result == "hello-world", "Magic character replacement failed")
 
 -- table functions
 local t = { 1, 2, 3 }
@@ -622,3 +690,13 @@ end
 assert(#points == 6, "Grid should generate 6 points")
 assert(points[1][1] == 1 and points[1][2] == 1, "First point should be (1,1)")
 assert(points[6][1] == 2 and points[6][2] == 3, "Last point should be (2,3)")
+
+-- Test space_lua stuff
+local parsedExpr = space_lua.parse_expression("1 + 1")
+local evalResult = space_lua.eval_expression(parsedExpr)
+assert(evalResult == 2, "Eval should return 2")
+
+-- Slightly more advanced example with augmented environment
+local parsedExpr = space_lua.parse_expression("tostring(a + 1)")
+local evalResult = space_lua.eval_expression(parsedExpr, { a = 1 })
+assert(evalResult == "2", "Eval should return 2 as a string")
