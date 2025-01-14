@@ -7,6 +7,7 @@ import type {
 import { evalPromiseValues } from "$common/space_lua/util.ts";
 import {
   luaCall,
+  luaEquals,
   luaSet,
   type LuaStackFrame,
 } from "$common/space_lua/runtime.ts";
@@ -298,20 +299,7 @@ export function evalExpression(
                   break;
                 }
                 case "Select": {
-                  query.select = clause.tableConstructor.fields.map((f) => {
-                    if (f.type === "PropField") {
-                      return {
-                        name: f.key,
-                        expr: f.value,
-                      };
-                    } else {
-                      throw new LuaRuntimeError(
-                        "Select fields must be named",
-                        sf.withCtx(f.ctx),
-                      );
-                    }
-                  });
-
+                  query.select = clause.expression;
                   break;
                 }
                 case "Limit": {
@@ -524,15 +512,15 @@ const operatorsMetaMethods: Record<string, {
   },
   "==": {
     metaMethod: "__eq",
-    nativeImplementation: (a, b) => a === b,
+    nativeImplementation: (a, b) => luaEquals(a, b),
   },
   "~=": {
     metaMethod: "__ne",
-    nativeImplementation: (a, b) => a !== b,
+    nativeImplementation: (a, b) => !luaEquals(a, b),
   },
   "!=": {
     metaMethod: "__ne",
-    nativeImplementation: (a, b) => a !== b,
+    nativeImplementation: (a, b) => !luaEquals(a, b),
   },
   "<": { metaMethod: "__lt", nativeImplementation: (a, b) => a < b },
   "<=": { metaMethod: "__le", nativeImplementation: (a, b) => a <= b },
