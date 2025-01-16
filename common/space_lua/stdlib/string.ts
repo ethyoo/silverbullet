@@ -34,13 +34,32 @@ export const stringApi = new LuaTable({
     },
   ),
   gmatch: new LuaBuiltinFunction((_sf, s: string, pattern: string) => {
-    const regex = new RegExp(pattern, "g");
+    const jsPattern = pattern
+      .replace(/%(.)/g, (_, char) => {
+        switch (char) {
+          case ".":
+            return "[.]";
+          case "%":
+            return "%";
+          case "d":
+            return "\\d";
+          case "s":
+            return "\\s";
+          case "w":
+            return "\\w";
+          default:
+            return char;
+        }
+      });
+
+    const regex = new RegExp(jsPattern, "g");
     return () => {
       const result = regex.exec(s);
       if (!result) {
         return;
       }
-      return new LuaMultiRes(result.slice(1));
+      const captures = result.slice(1);
+      return new LuaMultiRes(captures.length > 0 ? captures : [result[0]]);
     };
   }),
   gsub: new LuaBuiltinFunction(
@@ -156,5 +175,13 @@ export const stringApi = new LuaTable({
   }),
   split: new LuaBuiltinFunction((_sf, s: string, sep: string) => {
     return s.split(sep);
+  }),
+
+  // Non-standard
+  startswith: new LuaBuiltinFunction((_sf, s: string, prefix: string) => {
+    return s.startsWith(prefix);
+  }),
+  endswith: new LuaBuiltinFunction((_sf, s: string, suffix: string) => {
+    return s.endsWith(suffix);
   }),
 });
