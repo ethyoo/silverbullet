@@ -583,7 +583,12 @@ export async function evalStatement(
         .map((lval) => evalLValue(lval, env, sf)));
 
       for (let i = 0; i < lvalues.length; i++) {
-        luaSet(lvalues[i].env, lvalues[i].key, values[i], sf.withCtx(s.ctx));
+        await luaSet(
+          lvalues[i].env,
+          lvalues[i].key,
+          values[i],
+          sf.withCtx(s.ctx),
+        );
       }
 
       break;
@@ -730,9 +735,11 @@ export async function evalStatement(
         ),
       ).flatten();
       let iteratorValue: ILuaFunction | any = iteratorMultiRes.values[0];
+      // Handle the case where the iterator is a table and we need to call the each function
       if (Array.isArray(iteratorValue) || iteratorValue instanceof LuaTable) {
         iteratorValue = env.get("each").call(sf, iteratorValue);
       }
+
       if (!iteratorValue?.call) {
         console.error("Cannot iterate over", iteratorMultiRes.values[0]);
         throw new LuaRuntimeError(
