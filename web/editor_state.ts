@@ -80,7 +80,7 @@ export function createEditorState(
         ...client.ui.viewState.uiOptions.vimMode ? [vim({ status: true })] : [],
       ],
       [
-        ...readOnly || client.ui.viewState.uiOptions.forcedROMode
+        ...(readOnly || client.ui.viewState.uiOptions.forcedROMode)
           ? [EditorView.editable.of(false)]
           : [],
       ],
@@ -110,7 +110,7 @@ export function createEditorState(
       autocompletion({
         override: [
           client.editorComplete.bind(client),
-          client.clientSystem.slashCommandHook.slashCommandCompleter.bind(
+          client.clientSystem.slashCommandHook!.slashCommandCompleter.bind(
             client.clientSystem.slashCommandHook,
           ),
         ],
