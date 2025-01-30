@@ -188,7 +188,9 @@ export class Client implements ConfigContainer {
           // Exclude all plug space primitives paths
           return !this.plugSpaceRemotePrimitives.isLikelyHandled(path) ||
             // Except federated ones
-            path.startsWith("!");
+            path.startsWith("!") ||
+            // Also exclude Library/Std
+            path.startsWith("Library/Std");
         },
       )
       : new NoSyncSyncService(this.space);
@@ -303,6 +305,8 @@ export class Client implements ConfigContainer {
         } else { // initialSync
           // Let's load space scripts again, which probably weren't loaded before
           await this.clientSystem.loadSpaceScripts();
+          await this.loadCustomStyles();
+          this.rebuildEditorState();
           console.log(
             "Initial sync completed, now need to do a full space index to ensure all pages are indexed using any custom space script indexers",
           );
@@ -565,6 +569,7 @@ export class Client implements ConfigContainer {
         },
       );
     } else {
+      // Not in sync mode
       localSpacePrimitives = new EventedSpacePrimitives(
         this.plugSpaceRemotePrimitives,
         this.eventHook,
