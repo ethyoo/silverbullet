@@ -58,16 +58,15 @@ export const stringApi = new LuaTable({
     return String.fromCharCode(...args);
   }),
   find: new LuaBuiltinFunction(
-    (_sf, s: string, pattern: string, init?: number, plain?: boolean) => {
+    (_sf, s: string, pattern: string, init?: number) => {
       init = init ?? 1;
-      plain = plain ?? false;
       const result = s.slice(init - 1).match(pattern);
       if (!result) {
         return new LuaMultiRes([]);
       }
       return new LuaMultiRes([
-        result.index! + 1,
-        result.index! + result[0].length,
+        result.index! + init,
+        result.index! + init + result[0].length,
       ]);
     },
   ),
@@ -208,19 +207,25 @@ export const stringApi = new LuaTable({
   trim: new LuaBuiltinFunction((_sf, s: string) => {
     return s.trim();
   }),
-  trim_start: new LuaBuiltinFunction((_sf, s: string) => {
+  trimStart: new LuaBuiltinFunction((_sf, s: string) => {
     return s.trimStart();
   }),
-  trim_end: new LuaBuiltinFunction((_sf, s: string) => {
+  trimEnd: new LuaBuiltinFunction((_sf, s: string) => {
     return s.trimEnd();
   }),
-  match_regex: new LuaBuiltinFunction((_sf, s: string, pattern: string) => {
+  matchRegex: new LuaBuiltinFunction((_sf, s: string, pattern: string) => {
     const regex = new RegExp(pattern);
     const result = s.match(regex);
     return jsToLuaValue(result);
-    // if (!result) {
-    //   return new LuaMultiRes([]);
-    // }
-    // return new LuaMultiRes(result.slice(1));
+  }),
+  matchRegexAll: new LuaBuiltinFunction((_sf, s: string, pattern: string) => {
+    const regex = new RegExp(pattern, "g");
+    return () => {
+      const match = regex.exec(s);
+      if (!match) {
+        return;
+      }
+      return jsToLuaValue(match);
+    };
   }),
 });

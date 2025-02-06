@@ -15,7 +15,7 @@ import { stringApi } from "$common/space_lua/stdlib/string.ts";
 import { tableApi } from "$common/space_lua/stdlib/table.ts";
 import { osApi } from "$common/space_lua/stdlib/os.ts";
 import { jsApi } from "$common/space_lua/stdlib/js.ts";
-import { spaceLuaApi } from "$common/space_lua/stdlib/space_lua.ts";
+import { spaceluaApi } from "$common/space_lua/stdlib/space_lua.ts";
 import { mathApi } from "$common/space_lua/stdlib/math.ts";
 import { parse } from "$common/space_lua/parse.ts";
 import { evalStatement } from "$common/space_lua/eval.ts";
@@ -124,7 +124,10 @@ const xpcallFunction = new LuaBuiltinFunction(
 );
 
 const setmetatableFunction = new LuaBuiltinFunction(
-  (_sf, table: LuaTable, metatable: LuaTable) => {
+  (sf, table: LuaTable, metatable: LuaTable) => {
+    if (!metatable) {
+      throw new LuaRuntimeError("metatable cannot be set to nil", sf);
+    }
     table.metatable = metatable;
     return table;
   },
@@ -190,7 +193,7 @@ export function luaBuildStandardEnv() {
   env.set("math", mathApi);
   // Non-standard
   env.set("each", eachFunction);
-  env.set("space_lua", spaceLuaApi);
+  env.set("spacelua", spaceluaApi);
   // env.set("template", templateApi);
   return env;
 }
