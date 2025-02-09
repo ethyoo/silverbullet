@@ -1,43 +1,26 @@
 import type { PageMeta } from "../../plug-api/types.ts";
 import { space, system, template } from "@silverbulletmd/silverbullet/syscalls";
 import { cleanTemplate } from "./plug_api.ts";
-import { LuaTable } from "$common/space_lua/runtime.ts";
+import { LuaTable, luaToString } from "$common/space_lua/runtime.ts";
 
-export function defaultJsonTransformer(v: any): string {
+export function defaultTransformer(v: any): Promise<string> {
   if (v === undefined) {
-    return "";
+    return Promise.resolve("");
   }
   if (typeof v === "string") {
-    return v.replaceAll("\n", " ").replaceAll("|", "\\|");
+    return Promise.resolve(v.replaceAll("\n", " ").replaceAll("|", "\\|"));
   }
-  if (Array.isArray(v)) {
-    return v.map(defaultJsonTransformer).join(", ");
-  } else if (v && typeof v === "object") {
-    return Object.entries(v).map(([k, v]: [string, any]) =>
-      `${k}: ${defaultJsonTransformer(v)}`
-    ).join(", ");
+  if (v && typeof v === "object") {
+    return Promise.resolve(luaToString(v));
   }
-  return "" + v;
-}
-
-export function jsonObjectToMDTable(
-  obj: Record<string, any>,
-  valueTransformer: (v: any) => string = defaultJsonTransformer,
-): string {
-  const lines = [];
-  lines.push("| Key | Value |");
-  lines.push("| --- | --- |");
-  for (const [k, v] of Object.entries(obj)) {
-    lines.push(`| ${k} | ${valueTransformer(v)} |`);
-  }
-  return lines.join("\n");
+  return Promise.resolve("" + v);
 }
 
 // Nicely format an array of JSON objects as a Markdown table
-export function jsonToMDTable(
+export async function jsonToMDTable(
   jsonArray: any[],
-  valueTransformer: (v: any) => string = defaultJsonTransformer,
-): string {
+  valueTransformer: (v: any) => Promise<string> = defaultTransformer,
+): Promise<string> {
   const headers = new Set<string>();
   for (const entry of jsonArray) {
     for (const k of Object.keys(entry)) {
@@ -66,7 +49,7 @@ export function jsonToMDTable(
   for (const val of jsonArray) {
     const el = [];
     for (const prop of headerList) {
-      const s = valueTransformer(val[prop]);
+      const s = await valueTransformer(val[prop]);
       el.push(s);
     }
     lines.push("|" + el.join("|") + "|");
@@ -93,7 +76,7 @@ export async function renderQueryTemplate(
   });
 }
 
-export function renderExpressionResult(result: any): string {
+export function renderExpressionResult(result: any): Promise<string> {
   if (result instanceof LuaTable) {
     result = result.toJS();
   }
@@ -109,15 +92,15 @@ export function renderExpressionResult(result: any): string {
           JSON.stringify(result)
         }`,
       );
-      return JSON.stringify(result);
+      return Promise.resolve(JSON.stringify(result));
     }
   } else if (typeof result === "object" && result.constructor === Object) {
     // if result is a plain object, render as a markdown table
     return jsonToMDTable([result]);
   } else if (Array.isArray(result)) {
     // Not-object array, let's render it as a markdown list
-    return result.map((item) => `- ${item}`).join("\n");
+    return Promise.resolve(result.map((item) => `- ${item}`).join("\n"));
   } else {
-    return "" + result;
+    return Promise.resolve("" + result);
   }
 }
