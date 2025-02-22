@@ -119,6 +119,7 @@ export function TopBar({
               {actionButtons.map((actionButton) => {
                 const button = (
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
@@ -131,8 +132,12 @@ export function TopBar({
                   </button>
                 );
 
-                return actionButton.href !== undefined
-                  ? <a href={actionButton.href}>{button}</a>
+                return actionButton.href
+                  ? (
+                    <a href={actionButton.href} key={actionButton.href}>
+                      {button}
+                    </a>
+                  )
                   : button;
               })}
             </div>
