@@ -1,5 +1,10 @@
 SilverBullet is primarily configured via environment variables. This page gives a comprehensive overview of all configuration options. You can set these ad-hoc when running the SilverBullet server, or e.g. in your [[Install/Docker|docker-compose file]].
 
+# General configuration
+
+* `SB_INDEX_PAGE`: Sets the default page to load, defaults to `index`.
+* `SB_SPACE_IGNORE`: Ignore certain path patterns based on a .gitignore style format, e.g. `SB_SPACE_IGNORE="IgnoreMe/*"`.
+
 # Network
 Note: these options are primarily useful for [[Install/Deno]] deployments, not so much for [[Install/Docker]].
 

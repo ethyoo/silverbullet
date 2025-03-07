@@ -14,7 +14,7 @@ import { EventHook } from "../common/hooks/event.ts";
 import { type AppCommand, isValidEditor } from "$lib/command.ts";
 import {
   type LocationState,
-  parseLocationRefFromURI,
+  parseRefFromURI,
   PathPageNavigator,
 } from "./navigator.ts";
 
@@ -42,9 +42,10 @@ import { HttpSpacePrimitives } from "$common/spaces/http_space_primitives.ts";
 import { FallbackSpacePrimitives } from "$common/spaces/fallback_space_primitives.ts";
 import { FilteredSpacePrimitives } from "$common/spaces/filtered_space_primitives.ts";
 import {
-  encodeLocationRef,
   encodePageURI,
-  parseLocationRef,
+  encodeRef,
+  parseRef,
+  type Ref,
   validatePath,
 } from "@silverbulletmd/silverbullet/lib/page_ref";
 import { ClientSystem } from "./client_system.ts";
@@ -64,7 +65,6 @@ import { DataStoreSpacePrimitives } from "$common/spaces/datastore_space_primiti
 
 import { ensureSpaceIndex } from "$common/space_index.ts";
 import { renderTheTemplate } from "$common/syscalls/template.ts";
-import type { LocationRef } from "../plug-api/lib/page_ref.ts";
 import { ReadOnlySpacePrimitives } from "$common/spaces/ro_space_primitives.ts";
 import type { KvPrimitives } from "$lib/data/kv_primitives.ts";
 import {
@@ -84,13 +84,19 @@ const frontMatterRegex = /^---\n(([^\n]|\n)*?)---\n/;
 
 const autoSaveInterval = 1000;
 
+/**
+ * Client configuration that is set at boot time, doesn't change at runtime
+ */
+export type ClientConfig = {
+  spaceFolderPath: string;
+  indexPage: string;
+  syncMode?: boolean; // Set on the client based on localStorage
+  syncOnly: boolean; // Hide sync buttons etc
+  readOnly: boolean;
+  enableSpaceScript: boolean;
+};
+
 declare global {
-  var silverBulletConfig: {
-    spaceFolderPath: string;
-    syncOnly: boolean;
-    readOnly: boolean;
-    enableSpaceScript: boolean;
-  };
   var client: Client;
 }
 
@@ -142,20 +148,19 @@ export class Client implements ConfigContainer {
   fullSyncCompleted = false;
   syncService!: ISyncService;
 
-  private onLoadLocationRef: LocationRef;
+  private onLoadRef: Ref;
 
   constructor(
     private parent: Element,
-    public syncMode: boolean,
-    private readOnlyMode: boolean,
+    public clientConfig: ClientConfig,
   ) {
-    if (!syncMode) {
+    if (!clientConfig.syncMode) {
       this.fullSyncCompleted = true;
     }
     // Generate a semi-unique prefix for the database so not to reuse databases for different space paths
     this.dbPrefix = "" +
-      simpleHash(globalThis.silverBulletConfig.spaceFolderPath);
-    this.onLoadLocationRef = parseLocationRefFromURI();
+      simpleHash(clientConfig.spaceFolderPath);
+    this.onLoadRef = parseRefFromURI();
   }
 
   /**
@@ -179,12 +184,12 @@ export class Client implements ConfigContainer {
       this.mq,
       this.stateDataStore,
       this.eventHook,
-      this.readOnlyMode,
+      this.clientConfig.readOnly,
     );
 
     const localSpacePrimitives = await this.initSpace();
 
-    this.syncService = this.syncMode
+    this.syncService = this.clientConfig.syncMode
       ? new SyncService(
         localSpacePrimitives,
         this.plugSpaceRemotePrimitives,
@@ -223,7 +228,7 @@ export class Client implements ConfigContainer {
         console.warn("Not authenticated, redirecting to auth page");
         return;
       }
-      if (e.message.includes("Offline") && !this.syncMode) {
+      if (e.message.includes("Offline") && !this.clientConfig.syncMode) {
         // Offline and not in sync mode, this is not going to fly.
         this.flashNotification(
           "Could not reach remote server, going to reload in a few seconds",
@@ -519,7 +524,7 @@ export class Client implements ConfigContainer {
       ]);
       if (lastPath) {
         console.log("Navigating to last opened page", lastPath.path);
-        await this.navigate(parseLocationRef(lastPath));
+        await this.navigate(parseRef(lastPath));
       }
     }
     setTimeout(() => {
@@ -531,12 +536,12 @@ export class Client implements ConfigContainer {
   async initSpace(): Promise<SpacePrimitives> {
     this.httpSpacePrimitives = new HttpSpacePrimitives(
       location.origin,
-      globalThis.silverBulletConfig.spaceFolderPath,
+      this.clientConfig.spaceFolderPath,
     );
 
     let remoteSpacePrimitives: SpacePrimitives = this.httpSpacePrimitives;
 
-    if (this.readOnlyMode) {
+    if (this.clientConfig.readOnly) {
       remoteSpacePrimitives = new ReadOnlySpacePrimitives(
         remoteSpacePrimitives,
       );
@@ -545,14 +550,14 @@ export class Client implements ConfigContainer {
     this.plugSpaceRemotePrimitives = new PlugSpacePrimitives(
       remoteSpacePrimitives,
       this.clientSystem.namespaceHook,
-      this.syncMode ? undefined : "client",
+      this.clientConfig.readOnly ? undefined : "client",
     );
 
     let fileFilterFn: (s: string) => boolean = () => true;
 
     let localSpacePrimitives: SpacePrimitives | undefined;
 
-    if (this.syncMode) {
+    if (this.clientConfig.syncMode) {
       // We'll store the space files in a separate data store
       const spaceKvPrimitives = new IndexedDBKvPrimitives(
         `${this.dbPrefix}_synced_space`,
@@ -683,7 +688,7 @@ export class Client implements ConfigContainer {
   get currentPage(): string {
     return this.ui.viewState.current !== undefined
       ? this.ui.viewState.current.path
-      : this.onLoadLocationRef.page; // best effort
+      : this.onLoadRef.page; // best effort
   }
 
   currentPath(extension: boolean = false): string {
@@ -691,8 +696,8 @@ export class Client implements ConfigContainer {
       return this.ui.viewState.current.path +
         ((this.ui.viewState.current.kind === "page" && extension) ? ".md" : "");
     } else {
-      return this.onLoadLocationRef.page +
-        ((this.onLoadLocationRef.kind === "page" && extension) ? ".md" : "");
+      return this.onLoadRef.page +
+        ((this.onLoadRef.kind === "page" && extension) ? ".md" : "");
     }
   }
 
@@ -715,7 +720,8 @@ export class Client implements ConfigContainer {
 
           if (
             !this.ui.viewState.unsavedChanges ||
-            this.ui.viewState.uiOptions.forcedROMode || this.readOnlyMode
+            this.ui.viewState.uiOptions.forcedROMode ||
+            this.clientConfig.readOnly
           ) {
             // No unsaved changes, or read-only mode, not gonna save
             return resolve();
@@ -1096,15 +1102,15 @@ export class Client implements ConfigContainer {
   }
 
   async navigate(
-    locationRef: LocationRef,
+    ref: Ref,
     replaceState = false,
     newWindow = false,
   ) {
-    if (!locationRef.page) {
-      locationRef.kind = "page";
-      locationRef.page = cleanPageRef(
+    if (!ref.page) {
+      ref.kind = "page";
+      ref.page = cleanPageRef(
         await renderTheTemplate(
-          this.config.indexPage,
+          this.clientConfig.indexPage,
           {},
           {},
           client.stateDataStore.functionMap,
@@ -1113,7 +1119,7 @@ export class Client implements ConfigContainer {
     }
 
     try {
-      validatePath(locationRef.page);
+      validatePath(ref.page);
     } catch (e: any) {
       return this.flashNotification(e.message, "error");
     }
@@ -1121,10 +1127,10 @@ export class Client implements ConfigContainer {
     if (newWindow) {
       console.log(
         "Navigating to new page in new window",
-        `${location.origin}/${encodePageURI(encodeLocationRef(locationRef))}`,
+        `${location.origin}/${encodePageURI(encodeRef(ref))}`,
       );
       const win = globalThis.open(
-        `${location.origin}/${encodePageURI(encodeLocationRef(locationRef))}`,
+        `${location.origin}/${encodePageURI(encodeRef(ref))}`,
         "_blank",
       );
       if (win) {
@@ -1134,7 +1140,7 @@ export class Client implements ConfigContainer {
     }
 
     await this.pageNavigator!.navigate(
-      locationRef,
+      ref,
       replaceState,
     );
     this.focus();

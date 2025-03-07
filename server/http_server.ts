@@ -17,11 +17,11 @@ import { renderMarkdownToHtml } from "../plugs/markdown/markdown_render.ts";
 import {
   decodePageURI,
   looksLikePathWithExtension,
-  parsePageRef,
+  parseRef,
 } from "@silverbulletmd/silverbullet/lib/page_ref";
-import { base64Encode } from "$lib/crypto.ts";
 import { LockoutTimer } from "./lockout.ts";
 import type { AuthOptions } from "../cmd/server.ts";
+import type { ClientConfig } from "../web/client.ts";
 
 const authenticationExpirySeconds = 60 * 60 * 24 * 7; // 1 week
 
@@ -35,10 +35,12 @@ export type ServerOptions = {
   keyFile?: string;
   // Enable username/password/token auth
   auth?: AuthOptions;
+  spaceIgnore?: string;
   pagesPath: string;
   shellBackend: string;
   syncOnly: boolean;
   readOnly: boolean;
+  indexPage: string;
   enableSpaceScript: boolean;
 };
 
@@ -67,7 +69,7 @@ export class HttpServer {
     this.baseKvPrimitives = options.baseKvPrimitives;
   }
 
-  // Replaces some template variables in index.html in a rather ad-hoc manner, but YOLO
+  // Server-side renders a markdown file to HTML
   async renderHtmlPage(
     spaceServer: SpaceServer,
     pageName: string,
@@ -108,32 +110,22 @@ export class HttpServer {
       }
     }
 
-    // TODO: Replace this with a proper template engine
-    html = this.clientAssetBundle.readTextFileSync(".client/index.html")
-      .replace(
-        "{{SPACE_PATH}}",
-        spaceServer.pagesPath.replaceAll("\\", "\\\\"),
-      )
-      .replace(
-        "{{DESCRIPTION}}",
-        JSON.stringify(stripHtml(html).substring(0, 255)),
-      )
-      .replace(
-        "{{TITLE}}",
-        pageName,
-      ).replace(
-        "{{SYNC_ONLY}}",
-        spaceServer.syncOnly ? "true" : "false",
-      ).replace(
-        "{{ENABLE_SPACE_SCRIPT}}",
-        spaceServer.enableSpaceScript ? "true" : "false",
-      ).replace(
-        "{{READ_ONLY}}",
-        spaceServer.readOnly ? "true" : "false",
-      ).replace(
-        "{{CONTENT}}",
-        html,
-      );
+    const templateData = {
+      TITLE: pageName,
+      DESCRIPTION: stripHtml(html).substring(0, 255),
+      CONTENT: html,
+    };
+
+    html = this.clientAssetBundle.readTextFileSync(".client/index.html");
+
+    // Replace each template variable with its corresponding value
+    for (const [key, value] of Object.entries(templateData)) {
+      const placeholder = `{{${key}}}`;
+      const stringValue = typeof value === "boolean"
+        ? (value ? "true" : "false")
+        : (key === "DESCRIPTION" ? JSON.stringify(value) : String(value));
+      html = html.replace(placeholder, stringValue);
+    }
     return c.html(
       html,
       200,
@@ -259,7 +251,7 @@ export class HttpServer {
         // Serve the UI (index.html)
         let indexPage = "index";
         try {
-          indexPage = parsePageRef(this.spaceServer.config?.indexPage!).page;
+          indexPage = parseRef(this.spaceServer.indexPage).page;
         } catch (e: any) {
           console.error("Error parsing index page from config", e);
         }
@@ -273,8 +265,7 @@ export class HttpServer {
         if (
           this.clientAssetBundle.has(assetName) &&
           req.header("If-Modified-Since") ===
-            utcDateString(this.clientAssetBundle.getMtime(assetName)) &&
-          assetName !== "service_worker.js"
+            utcDateString(this.clientAssetBundle.getMtime(assetName))
         ) {
           return Promise.resolve(c.body(null, 304));
         }
@@ -284,33 +275,13 @@ export class HttpServer {
           assetName,
         );
         c.header("Content-length", "" + data.length);
-        if (assetName !== "service_worker.js") {
-          c.header(
-            "Last-Modified",
-            utcDateString(this.clientAssetBundle.getMtime(assetName)),
-          );
-        }
+        c.header(
+          "Last-Modified",
+          utcDateString(this.clientAssetBundle.getMtime(assetName)),
+        );
 
         if (req.method === "GET") {
-          if (assetName === "service_worker.js") {
-            c.header("Cache-Control", "no-cache");
-            const textData = new TextDecoder().decode(data);
-            // console.log(
-            //   "Swapping out config hash in service worker",
-            // );
-            return Promise.resolve(c.body(textData.replaceAll(
-              "{{CONFIG_HASH}}",
-              base64Encode(
-                JSON.stringify([
-                  this.spaceServer.syncOnly,
-                  this.spaceServer.readOnly,
-                  this.spaceServer.enableSpaceScript,
-                ]),
-              ),
-            )));
-          } else {
-            return Promise.resolve(c.body(new Uint8Array(data).buffer));
-          }
+          return Promise.resolve(c.body(new Uint8Array(data).buffer));
         } // else e.g. HEAD, OPTIONS, don't send body
       } catch {
         return next();
@@ -343,6 +314,20 @@ export class HttpServer {
       deleteCookie(c, "refreshLogin");
 
       return c.redirect("/.auth");
+    });
+
+    // Fetch config
+    this.app.get("/.config", (c) => {
+      const clientConfig: ClientConfig = {
+        syncOnly: this.spaceServer.syncOnly,
+        readOnly: this.spaceServer.readOnly,
+        enableSpaceScript: this.spaceServer.enableSpaceScript,
+        spaceFolderPath: this.spaceServer.pagesPath,
+        indexPage: this.spaceServer.indexPage,
+      };
+      return c.json(clientConfig, 200, {
+        "Cache-Control": "no-cache",
+      });
     });
 
     this.app.get("/.auth", (c) => {

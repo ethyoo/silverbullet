@@ -45,6 +45,8 @@ export class SpaceServer implements ConfigContainer {
   readOnly: boolean;
   shellBackend: ShellBackend;
   enableSpaceScript: boolean;
+  indexPage: string;
+  spaceIgnore?: string;
 
   constructor(
     options: ServerOptions,
@@ -56,8 +58,10 @@ export class SpaceServer implements ConfigContainer {
     this.auth = options.auth;
     this.syncOnly = options.syncOnly;
     this.readOnly = options.readOnly;
+    this.indexPage = options.indexPage;
     this.config = defaultConfig;
     this.enableSpaceScript = options.enableSpaceScript;
+    this.spaceIgnore = options.spaceIgnore;
 
     this.jwtIssuer = new JWTIssuer(kvPrimitives);
 
@@ -68,6 +72,9 @@ export class SpaceServer implements ConfigContainer {
 
   async init() {
     let fileFilterFn: (s: string) => boolean = () => true;
+    if (this.spaceIgnore) {
+      fileFilterFn = gitIgnoreCompiler(this.spaceIgnore).accepts;
+    }
 
     this.spacePrimitives = new FilteredSpacePrimitives(
       new AssetBundlePlugSpacePrimitives(
@@ -75,14 +82,6 @@ export class SpaceServer implements ConfigContainer {
         this.plugAssetBundle,
       ),
       (meta) => fileFilterFn(meta.name),
-      async () => {
-        await this.loadConfig();
-        if (typeof this.config?.spaceIgnore === "string") {
-          fileFilterFn = gitIgnoreCompiler(this.config.spaceIgnore).accepts;
-        } else {
-          fileFilterFn = () => true;
-        }
-      },
     );
 
     if (this.readOnly) {
