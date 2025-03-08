@@ -21,8 +21,10 @@ import type { AppViewState } from "./type.ts";
 
 import type {
   AppEvent,
+  ClickEvent,
   CompleteEvent,
   DocumentMeta,
+  EnrichedClickEvent,
   SlashCompletions,
 } from "../plug-api/types.ts";
 import type { StyleObject } from "../plugs/index/style.ts";
@@ -633,7 +635,7 @@ export class Client implements ConfigContainer {
           this.flashNotification(
             "Page or document changed elsewhere, reloading",
           );
-          this.reloadEditor();
+          this.reloadPage();
         }
       },
     );
@@ -684,6 +686,22 @@ export class Client implements ConfigContainer {
 
   dispatchAppEvent(name: AppEvent, ...args: any[]): Promise<any[]> {
     return this.eventHook.dispatchEvent(name, ...args);
+  }
+
+  dispatchClickEvent(clickEvent: ClickEvent) {
+    const editorState = this.editorView.state;
+    const sTree = syntaxTree(editorState);
+    const currentNode = sTree.resolveInner(clickEvent.pos);
+
+    const parentNodes: string[] = this.extractParentNodes(
+      editorState,
+      currentNode,
+    );
+    const enrichedEvent: EnrichedClickEvent = {
+      ...clickEvent,
+      parentNodes,
+    };
+    return this.dispatchAppEvent("page:click", enrichedEvent);
   }
 
   // Save the current page
@@ -1041,21 +1059,15 @@ export class Client implements ConfigContainer {
     >;
   }
 
-  async reloadEditor() {
-    if (this.isDocumentEditor()) await this.reloadDocumentEditor();
-    else await this.reloadPage();
-  }
-
   async reloadPage() {
-    console.log("Reloading page");
-    clearTimeout(this.saveTimeout);
-    await this.loadPage(this.currentPage);
-  }
-
-  async reloadDocumentEditor() {
     console.log("Reloading dediacted editor");
     clearTimeout(this.saveTimeout);
-    await this.loadDocumentEditor(this.currentPath());
+
+    if (this.isDocumentEditor()) {
+      await this.loadDocumentEditor(this.currentPath());
+    } else {
+      await this.loadPage(this.currentPage);
+    }
   }
 
   // Focus the editor
