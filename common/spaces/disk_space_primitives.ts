@@ -87,13 +87,14 @@ export class DiskSpacePrimitives implements SpacePrimitives {
       });
 
       // Actually write the file
-      await file.write(data);
+      const writer = file.writable.getWriter();
+      await writer.write(data);
 
       if (meta?.lastModified) {
         // console.log("Seting mtime to", new Date(meta.lastModified));
         await file.utime(new Date(), new Date(meta.lastModified));
       }
-      file.close();
+      await writer.close();
 
       // Invalidate cache and trigger an update
       this.fileListCache = [];
@@ -152,9 +153,6 @@ export class DiskSpacePrimitives implements SpacePrimitives {
 
     // Otherwise get the file list and wait for it
     const allFiles: FileMeta[] = await this.getFileList();
-
-    const endTime = performance.now();
-    console.info("Fetched uncached file list in", endTime - startTime, "ms");
 
     this.fileListCache = allFiles;
     this.fileListCacheTime = startTime;
