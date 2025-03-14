@@ -1,6 +1,7 @@
-import { deleteCookie, getCookie, setCookie } from "hono/helper.ts";
-import { cors } from "hono/middleware.ts";
-import { type Context, Hono, validator } from "hono/mod.ts";
+import { type Context, Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { cors } from "hono/cors";
+import { validator } from "hono/validator";
 import type { AssetBundle } from "$lib/asset_bundle/bundle.ts";
 import type {
   EndpointRequest,
@@ -225,7 +226,7 @@ export class HttpServer {
             ctx.header(key, value);
           }
         }
-        ctx.status(response.status || 200);
+        ctx.status(response.status as any || 200);
         if (typeof response.body === "string") {
           return ctx.text(response.body);
         } else if (response.body instanceof Uint8Array) {
@@ -335,7 +336,7 @@ export class HttpServer {
 
       return c.html(html);
     }).post(
-      validator("form", (value, c) => {
+      validator("form", (value: any, c: Context) => {
         const username = value["username"];
         const password = value["password"];
         const rememberMe = value["rememberMe"];
@@ -352,7 +353,7 @@ export class HttpServer {
       }),
       async (c) => {
         const req = c.req;
-        const url = new URL(c.req.url);
+        const url = new URL(req.url);
         const { username, password, rememberMe } = req.valid("form");
 
         const {
@@ -385,7 +386,7 @@ export class HttpServer {
           if (rememberMe) {
             setCookie(c, "refreshLogin", "true", { expires: inAWeek });
           }
-          const values = await c.req.parseBody();
+          const values = await req.parseBody();
           const from = values["from"];
           return c.redirect(typeof from === "string" ? from : "/");
         } else {
@@ -410,9 +411,9 @@ export class HttpServer {
       const redirectToAuth = () => {
         // Try filtering api paths
         if (req.path.startsWith("/.") || req.path.endsWith(".md")) {
-          return c.redirect("/.auth", 401);
+          return c.redirect("/.auth", 401 as any);
         } else {
-          return c.redirect(`/.auth?from=${req.path}`, 401);
+          return c.redirect(`/.auth?from=${req.path}`, 401 as any);
         }
       };
       if (!excludedPaths.includes(url.pathname)) {
@@ -761,7 +762,12 @@ export class HttpServer {
           for (const [key, value] of fetchReq.headers.entries()) {
             responseHeaders[key] = value;
           }
-          return c.body(fetchReq.body, fetchReq.status, responseHeaders);
+          // Set status before returning the body
+          c.status(fetchReq.status as any);
+          // Handle null body case
+          return fetchReq.body
+            ? c.body(fetchReq.body, responseHeaders)
+            : c.body(null, responseHeaders);
         } catch (e: any) {
           console.error("Error fetching federated link", e);
           return c.text(e.message, 500);
