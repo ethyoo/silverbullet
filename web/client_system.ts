@@ -37,7 +37,6 @@ import { templateSyscalls } from "$common/syscalls/template.ts";
 import { codeWidgetSyscalls } from "./syscalls/code_widget.ts";
 import { clientCodeWidgetSyscalls } from "./syscalls/client_code_widget.ts";
 import { KVPrimitivesManifestCache } from "$lib/plugos/manifest_cache.ts";
-import type { Query } from "../plug-api/types.ts";
 import { PanelWidgetHook } from "./hooks/panel_widget.ts";
 import { createKeyBindings } from "./editor_state.ts";
 import { CommonSystem } from "$common/common_system.ts";
@@ -49,6 +48,7 @@ import { indexSyscalls } from "$common/syscalls/index.ts";
 import { commandSyscalls } from "$common/syscalls/command.ts";
 import { eventListenerSyscalls } from "$common/syscalls/event.ts";
 import { DocumentEditorHook } from "./hooks/document_editor.ts";
+import type { LuaCollectionQuery } from "$common/space_lua/query_collection.ts";
 
 const plugNameExtractRegex = /\/(.+)\.plug\.js$/;
 
@@ -240,11 +240,8 @@ export class ClientSystem extends CommonSystem {
     return this.system.localSyscall(name, args);
   }
 
-  queryObjects<T>(tag: string, query: Query): Promise<T[]> {
-    return this.localSyscall(
-      "system.invokeFunction",
-      ["index.queryObjects", tag, query],
-    );
+  queryLuaObjects<T>(tag: string, query: LuaCollectionQuery): Promise<T[]> {
+    return this.system.invokeFunction("index.queryLuaObjects", [tag, query]);
   }
 
   getObjectByRef<T>(page: string, tag: string, ref: string) {
