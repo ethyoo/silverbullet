@@ -286,6 +286,7 @@ pub fn build_spaces_router(state: Arc<SpaceIndexState>, admin_api: Router) -> Ro
         // Single-segment catch-all for a space id. Static segments above win
         // in matchit, so `/new`, `/users` and `/login` are unaffected.
         .route("/{id}", get(handle_shell))
+        .route("/{id}/git", get(handle_shell))
         .route("/assets/{file}", get(handle_asset))
         .route("/api/session", get(handle_session))
         .route(
@@ -335,6 +336,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         }
     }
@@ -934,6 +937,7 @@ mod tests {
             "/users/alice",
             "/login",
             "/some-space-id",
+            "/some-space-id/git",
         ] {
             let response = send(
                 &router,

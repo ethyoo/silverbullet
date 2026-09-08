@@ -125,6 +125,15 @@ pub fn validate(
                 );
             }
         }
+        if !space.git_sync().mode.is_off()
+            && space.revisions != silverbullet_server_common::RevisionsMode::Managed
+        {
+            err(
+                &mut errors,
+                format!("{id}.gitSync"),
+                "git sync requires managed revisions; remove the Git connection before disabling automatic revisions",
+            );
+        }
     }
 
     // Resolved folders must not nest or collide. Resolution mirrors
@@ -180,6 +189,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         }
     }
@@ -499,5 +510,76 @@ mod tests {
         );
         let errs = validate(&cfg(vec![("a", s)]), dir.path(), &users(&[]));
         assert!(errs.iter().any(|e| e.field == "a.name"), "{errs:?}");
+    }
+
+    #[test]
+    fn git_sync_requires_managed_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = space(
+            "A",
+            Binding::Prefix {
+                prefix: "/a".into(),
+            },
+        );
+        s.revisions = silverbullet_server_common::RevisionsMode::Unmanaged;
+        s.git_sync = Some(crate::multi::config::GitSyncConfig {
+            paused: false,
+            mode: crate::multi::config::GitSyncMode::Key,
+            pull_interval_secs: 300,
+        });
+
+        let errs = validate(&cfg(vec![("a", s)]), dir.path(), &users(&[]));
+        assert!(
+            errs.iter().any(|e| e.field == "a.gitSync"),
+            "expected a gitSync error, got {errs:?}"
+        );
+    }
+
+    /// Manual mode is just as much "on" as key mode -- it is the credential
+    /// story that differs, not whether the space touches a remote.
+    #[test]
+    fn manual_git_sync_also_requires_managed_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = space(
+            "A",
+            Binding::Prefix {
+                prefix: "/a".into(),
+            },
+        );
+        s.revisions = silverbullet_server_common::RevisionsMode::Unmanaged;
+        s.git_sync = Some(crate::multi::config::GitSyncConfig {
+            paused: false,
+            mode: crate::multi::config::GitSyncMode::Manual,
+            pull_interval_secs: 300,
+        });
+
+        let errs = validate(&cfg(vec![("a", s)]), dir.path(), &users(&[]));
+        assert!(
+            errs.iter().any(|e| e.field == "a.gitSync"),
+            "expected a gitSync error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn git_sync_off_on_unmanaged_revisions_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = space(
+            "A",
+            Binding::Prefix {
+                prefix: "/a".into(),
+            },
+        );
+        s.revisions = silverbullet_server_common::RevisionsMode::Unmanaged;
+        s.git_sync = Some(crate::multi::config::GitSyncConfig {
+            paused: false,
+            mode: crate::multi::config::GitSyncMode::Off,
+            pull_interval_secs: 300,
+        });
+
+        let errs = validate(&cfg(vec![("a", s)]), dir.path(), &users(&[]));
+        assert!(
+            !errs.iter().any(|e| e.field == "a.gitSync"),
+            "expected no gitSync error, got {errs:?}"
+        );
     }
 }

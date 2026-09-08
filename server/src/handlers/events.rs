@@ -94,25 +94,70 @@ async fn wait_for_shutdown(mut shutdown: Option<tokio::sync::watch::Receiver<()>
     }
 }
 
-pub async fn handle_events(State(state): State<Arc<ServerState>>) -> Response {
+/// A named `sync` event, delivered only to `addEventListener("sync")` --
+/// `onmessage` (old clients included) never sees it, so this is additive.
+/// Stripped of `Error`'s message: this endpoint needs only `AccessLevel::Read`,
+/// so on a public space the raw git stderr would reach any visitor.
+fn sync_event(state: &crate::revisions::SyncState) -> Event {
+    let state = state.without_message();
+    Event::default()
+        .event("sync")
+        .data(serde_json::to_string(&state).expect("SyncState serializes"))
+}
+
+pub(crate) async fn handle_events(
+    State(state): State<Arc<ServerState>>,
+    axum::Extension(access): axum::Extension<crate::router::RevisionAccess>,
+) -> Response {
     let Some(tx) = &state.fs_events else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let stream = BroadcastStream::new(tx.subscribe()).filter_map(
-        |item: Result<crate::watcher::FsEvent, BroadcastStreamRecvError>| match item {
-            Ok(ev) => Some(Ok::<Event, Infallible>(
-                Event::default().data(serde_json::to_string(&ev).expect("FsEvent serializes")),
-            )),
-            // Lagged: this consumer overflowed the broadcast buffer and lost
-            // events; hand it a resync instead of losing them silently. Built
-            // through the same `FsEvent::resync()` constructor the watcher's
-            // own flood-control path uses, so the two can't diverge.
-            Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(Event::default().data(
-                serde_json::to_string(&crate::watcher::FsEvent::resync())
-                    .expect("FsEvent serializes"),
-            ))),
-        },
+    let fs_stream: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(
+        BroadcastStream::new(tx.subscribe()).filter_map(
+            |item: Result<crate::watcher::FsEvent, BroadcastStreamRecvError>| match item {
+                Ok(ev) => Some(Ok::<Event, Infallible>(
+                    Event::default().data(serde_json::to_string(&ev).expect("FsEvent serializes")),
+                )),
+                // Lagged: this consumer overflowed the broadcast buffer and lost
+                // events; hand it a resync instead of losing them silently. Built
+                // through the same `FsEvent::resync()` constructor the watcher's
+                // own flood-control path uses, so the two can't diverge.
+                Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(Event::default().data(
+                    serde_json::to_string(&crate::watcher::FsEvent::resync())
+                        .expect("FsEvent serializes"),
+                ))),
+            },
+        ),
     );
+    // Subscribe before reading the current state, so a transition racing this
+    // connection is at worst delivered twice rather than dropped -- and read
+    // `last_broadcast_sync_state`, never `sync_state`, which can transiently
+    // hold `Syncing` mid-tick.
+    let sync_stream: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        match state.revisions.as_ref().filter(|_| access.0) {
+            Some(engine) => {
+                let engine = engine.clone();
+                let rx = engine.subscribe_sync();
+                let initial = tokio_stream::once(Ok::<Event, Infallible>(sync_event(
+                    &engine.last_broadcast_sync_state(),
+                )));
+                let updates = BroadcastStream::new(rx).filter_map(
+                    move |item: Result<crate::revisions::SyncState, BroadcastStreamRecvError>| {
+                        match item {
+                            Ok(s) => Some(Ok::<Event, Infallible>(sync_event(&s))),
+                            // Lagged: re-derive from the last terminal state
+                            // rather than lose the transition silently.
+                            Err(BroadcastStreamRecvError::Lagged(_)) => {
+                                Some(Ok(sync_event(&engine.last_broadcast_sync_state())))
+                            }
+                        }
+                    },
+                );
+                Box::pin(initial.chain(updates))
+            }
+            None => Box::pin(tokio_stream::empty()),
+        };
+    let stream = fs_stream.merge(sync_stream);
     // Gecko and WebKit leave EventSource at CONNECTING until the first body
     // byte arrives, so without this comment `onopen` waits for the first real
     // event (or the 30s ping) -- and until it fires the client cannot tell a
@@ -199,6 +244,195 @@ mod tests {
         assert!(text.contains(r#""name":"test.md""#), "body was: {text}");
         assert!(text.contains(r#""action":"change""#));
         assert!(text.contains(r#""lastModified":42"#));
+    }
+
+    /// The client's `EventSource.onmessage` never sees a named event, so a
+    /// conflicted transition must arrive tagged `event: sync` rather than as
+    /// an unnamed frame indistinguishable from an `FsEvent`.
+    #[tokio::test]
+    async fn conflicted_sync_transition_produces_a_named_sync_frame() {
+        use tokio_stream::StreamExt as _;
+
+        let mut state = test_state();
+        let (tx, _keep) = broadcast::channel::<FsEvent>(16);
+        state.fs_events = Some(tx);
+        let (engine, _dir) = crate::revisions::engine::engine_with_sync_for_test();
+        state.revisions = Some(engine.clone());
+        let app = build_router(Arc::new(state));
+
+        let resp = app
+            .oneshot(Request::get("/.events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        let opening = frames.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&opening).starts_with(':'));
+
+        // The engine's current state, sent unconditionally as the first sync
+        // frame -- see `a_client_connecting_mid_conflict_learns_immediately`
+        // for why. Here the engine starts Idle, so this is that frame, not
+        // the conflicted transition triggered below.
+        let initial = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("no initial sync frame arrived")
+            .unwrap()
+            .unwrap();
+        let initial_text = String::from_utf8_lossy(&initial);
+        assert!(
+            initial_text.starts_with("event: sync\n"),
+            "frame was: {initial_text}"
+        );
+        assert!(
+            initial_text.contains(r#""state":"idle""#),
+            "frame was: {initial_text}"
+        );
+
+        engine.set_sync_state_for_test(crate::revisions::SyncState::Conflicted {
+            paths: vec!["a.md".into()],
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("no sync frame arrived")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.starts_with("event: sync\n"), "frame was: {text}");
+        assert!(
+            text.contains(r#""state":"conflicted""#),
+            "frame was: {text}"
+        );
+        assert!(text.contains(r#""a.md""#), "frame was: {text}");
+    }
+
+    /// `/.events` needs only `AccessLevel::Read`, so on a public space this
+    /// frame reaches an unauthenticated visitor. `Error`'s message is git's
+    /// own stderr and must not ride along; `/.revisions/` (Write) keeps it.
+    #[tokio::test]
+    async fn an_error_sync_frame_carries_the_kind_but_never_the_message() {
+        use tokio_stream::StreamExt as _;
+
+        let mut state = test_state();
+        let (tx, _keep) = broadcast::channel::<FsEvent>(16);
+        state.fs_events = Some(tx);
+        let (engine, _dir) = crate::revisions::engine::engine_with_sync_for_test();
+        engine.set_sync_state_for_test(crate::revisions::SyncState::Error {
+            kind: "Other".into(),
+            message: "fatal: could not read from 'git.internal.test:notes'".into(),
+        });
+        state.revisions = Some(engine);
+        let app = build_router(Arc::new(state));
+
+        let resp = app
+            .oneshot(Request::get("/.events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut frames = resp.into_body().into_data_stream();
+        let opening = frames.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&opening).starts_with(':'));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("no sync frame arrived")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.starts_with("event: sync\n"), "frame was: {text}");
+        assert!(text.contains(r#""kind":"Other""#), "frame was: {text}");
+        assert!(!text.contains("message"), "frame was: {text}");
+        assert!(!text.contains("git.internal.test"), "frame was: {text}");
+    }
+
+    /// The scenario Task 11 exists for: Space History isn't open and the
+    /// conflicted page isn't open, so a fresh connection (a page load, or a
+    /// reconnect after a drop) is the only way this client can learn about
+    /// an *already* unresolved conflict -- there is no future transition to
+    /// wait for, since the engine transitioned into it before this client
+    /// ever subscribed.
+    #[tokio::test]
+    async fn a_client_connecting_mid_conflict_learns_immediately() {
+        use tokio_stream::StreamExt as _;
+
+        let mut state = test_state();
+        let (tx, _keep) = broadcast::channel::<FsEvent>(16);
+        state.fs_events = Some(tx);
+        let (engine, _dir) = crate::revisions::engine::engine_with_sync_for_test();
+        engine.set_sync_state_for_test(crate::revisions::SyncState::Conflicted {
+            paths: vec!["a.md".into()],
+        });
+        state.revisions = Some(engine);
+        let app = build_router(Arc::new(state));
+
+        let resp = app
+            .oneshot(Request::get("/.events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        let opening = frames.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&opening).starts_with(':'));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("no sync frame arrived")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.starts_with("event: sync\n"), "frame was: {text}");
+        assert!(
+            text.contains(r#""state":"conflicted""#),
+            "frame was: {text}"
+        );
+        assert!(text.contains(r#""a.md""#), "frame was: {text}");
+    }
+
+    /// The race Finding 1 was about: a tick can be mid-flight (`sync_state`
+    /// transiently `Syncing`, `last_broadcast_sync_state` still holding the
+    /// previous terminal outcome) at the exact moment a client connects. The
+    /// initial frame must reflect the last *terminal* state, not whatever
+    /// `sync_state` happens to hold right then -- otherwise this client's
+    /// only frame is `Syncing`, and the tick's own `Conflicted` outcome
+    /// (unchanged from before) broadcasts nothing to follow it up with.
+    #[tokio::test]
+    async fn a_client_connecting_mid_tick_still_sees_the_terminal_conflict_not_syncing() {
+        use tokio_stream::StreamExt as _;
+
+        let mut state = test_state();
+        let (tx, _keep) = broadcast::channel::<FsEvent>(16);
+        state.fs_events = Some(tx);
+        let (engine, _dir) = crate::revisions::engine::engine_with_sync_for_test();
+        engine.set_sync_state_for_test(crate::revisions::SyncState::Conflicted {
+            paths: vec!["a.md".into()],
+        });
+        // Simulates a tick in flight: `sync_state` (what a naive read would
+        // use) now says `Syncing`, but `last_broadcast_sync_state` (what the
+        // fix reads) still says `Conflicted`.
+        engine.set_sync_state_silent_for_test(crate::revisions::SyncState::Syncing);
+        state.revisions = Some(engine);
+        let app = build_router(Arc::new(state));
+
+        let resp = app
+            .oneshot(Request::get("/.events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut frames = resp.into_body().into_data_stream();
+        let opening = frames.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&opening).starts_with(':'));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("no sync frame arrived")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.starts_with("event: sync\n"), "frame was: {text}");
+        assert!(
+            text.contains(r#""state":"conflicted""#),
+            "frame was: {text}, expected the terminal Conflicted, not Syncing"
+        );
+        assert!(text.contains(r#""a.md""#), "frame was: {text}");
     }
 
     #[tokio::test]

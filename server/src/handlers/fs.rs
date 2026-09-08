@@ -306,6 +306,11 @@ pub async fn handle_fs_put(
     let path_inner = path.clone();
     let result: Result<Result<(FileMeta, String), CurrentRevision>, SpaceError> =
         run_blocking(move || {
+            let _mutation = state_inner
+                .fs_guard
+                .mutation
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let lock = state_inner.fs_guard.path_lock(&path_inner);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -337,6 +342,9 @@ pub async fn handle_fs_put(
                 result_meta.size,
                 result_meta.last_modified,
             );
+            if let Some(engine) = &state_inner.revisions {
+                engine.notify_file_saved();
+            }
             Ok(Ok((result_meta, body_hash)))
         })
         .await;
@@ -372,6 +380,11 @@ pub async fn handle_fs_delete(
     let state_inner = state.clone();
     let path_inner = path.clone();
     let result: Result<Result<(), CurrentRevision>, SpaceError> = run_blocking(move || {
+        let _mutation = state_inner
+            .fs_guard
+            .mutation
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let lock = state_inner.fs_guard.path_lock(&path_inner);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -417,6 +430,9 @@ pub async fn handle_fs_delete(
                     source,
                 ),
             }
+        }
+        if let Some(engine) = &state_inner.revisions {
+            engine.notify_file_saved();
         }
         Ok(Ok(()))
     })
@@ -491,9 +507,18 @@ pub async fn handle_fs_reconcile(
             ));
         }
 
+        let _mutation = state
+            .fs_guard
+            .mutation
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let lock = state.fs_guard.path_lock(&path);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        match reconcile_locked(&state, &path, &request, &attribution)? {
+        let result = reconcile_locked(&state, &path, &request, &attribution)?;
+        if let Some(engine) = &state.revisions {
+            engine.notify_file_saved();
+        }
+        match result {
             Ok(resp) => Ok(ReconcileOutcome::Response(resp)),
             Err(msg) => Ok(ReconcileOutcome::Conflict(msg)),
         }

@@ -54,6 +54,7 @@ pub enum SpaceState {
 
 pub struct MultiManager {
     root: PathBuf,
+    pub(super) git_connections: Mutex<()>,
     config_path: PathBuf,
     deps: InstanceDeps,
     /// Current persisted config + built instances, mutated under one lock so
@@ -70,6 +71,19 @@ struct Inner {
     instances: HashMap<String, Arc<SpaceInstance>>,
 }
 
+/// What a config change takes out of service. Dropping a `SpaceInstance`
+/// drops its `RevisionEngine`, whose `Drop` joins the history thread -- and
+/// that thread may be inside a `git fetch`/`git push`, bounded by the
+/// transfer rather than by `ConnectTimeout`. Doing that under `state`'s lock
+/// stalls every admin call on an unrelated space's network round trip, so
+/// each mutation declares this *before* taking the lock: locals drop in
+/// reverse declaration order, which puts this drop after the guard's.
+#[derive(Default)]
+struct Retired {
+    instances: Vec<Arc<SpaceInstance>>,
+    table: Option<Arc<RoutingTable>>,
+}
+
 impl MultiManager {
     /// Load spaces.json (hard error when malformed), build all instances, and
     /// return the manager. `known_users` seeds member validation; refresh it
@@ -80,7 +94,8 @@ impl MultiManager {
         known_users: BTreeSet<String>,
     ) -> Result<Arc<Self>, String> {
         let config_path = root.join("spaces.json");
-        let config = MultiConfig::load(&config_path)?;
+        let mut config = MultiConfig::load(&config_path)?;
+        super::git_connection::recover(&root, &mut config)?;
         let errors = validate(&config, &root, &known_users);
         if !errors.is_empty() {
             let msgs: Vec<String> = errors
@@ -98,6 +113,7 @@ impl MultiManager {
         let table = RoutingTable::build(instances.clone());
         Ok(Arc::new(Self {
             root,
+            git_connections: Mutex::new(()),
             config_path,
             deps,
             state: Mutex::new(Inner { config, instances }),
@@ -137,6 +153,7 @@ impl MultiManager {
         let table = RoutingTable::build(instances.clone());
         Ok(Arc::new(Self {
             root,
+            git_connections: Mutex::new(()),
             config_path,
             deps,
             state: Mutex::new(Inner { config, instances }),
@@ -151,6 +168,13 @@ impl MultiManager {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The live built instance for `id`, if any — the admin git-sync routes
+    /// use this to reach a running space's `RevisionEngine` and resolved
+    /// folder, since they are not nested inside that space's own router.
+    pub fn instance(&self, id: &str) -> Option<Arc<SpaceInstance>> {
+        self.state.lock().unwrap().instances.get(id).cloned()
     }
 
     /// Replace the set of usernames `members` entries are validated against.
@@ -188,6 +212,7 @@ impl MultiManager {
         username: &str,
         new_known_users: BTreeSet<String>,
     ) -> Result<(), ApiError> {
+        let mut retired = Retired::default();
         let mut inner = self.state.lock().unwrap();
         *self.known_users.write().unwrap() = new_known_users;
         let mut new_config = inner.config.clone();
@@ -200,13 +225,20 @@ impl MultiManager {
         if !changed {
             return Ok(());
         }
-        self.apply_locked(&mut inner, new_config)
+        self.apply_locked(&mut inner, new_config, &mut retired, None, true)
     }
 
     /// Validate + persist + rebuild + swap. Called with the state lock held by
     /// the CRUD methods (single mutation path). On validation or persist
     /// failure, `inner` is left completely untouched.
-    fn apply_locked(&self, inner: &mut Inner, new_config: MultiConfig) -> Result<(), ApiError> {
+    fn apply_locked(
+        &self,
+        inner: &mut Inner,
+        new_config: MultiConfig,
+        retired: &mut Retired,
+        journal_id: Option<&str>,
+        preserve_sync_history: bool,
+    ) -> Result<(), ApiError> {
         let known_users = self.known_users.read().unwrap().clone();
         let errors = validate(&new_config, &self.root, &known_users);
         if !errors.is_empty() {
@@ -215,27 +247,110 @@ impl MultiManager {
         new_config
             .save(&self.config_path)
             .map_err(ApiError::Internal)?;
+        for (id, instance) in &inner.instances {
+            if new_config.spaces.get(id) != Some(&instance.config) {
+                if let Some(engine) = &instance.revisions {
+                    engine.quiesce_sync();
+                }
+            }
+        }
+        if let Some(id) = journal_id {
+            super::git_connection::finish_change(&self.root, id).map_err(ApiError::Internal)?;
+        }
         // Rebuild changed/new instances; reuse Arcs for untouched ones.
         let mut instances = HashMap::new();
         for (id, cfg) in &new_config.spaces {
             match inner.instances.get(id) {
-                Some(existing) if &existing.config == cfg => {
+                Some(existing)
+                    if &existing.config == cfg
+                        && (journal_id != Some(id.as_str()) || preserve_sync_history) =>
+                {
                     instances.insert(id.clone(), existing.clone());
                 }
                 _ => {
-                    instances.insert(id.clone(), Arc::new(build_instance(id, cfg, &self.deps)));
+                    let instance = Arc::new(build_instance(id, cfg, &self.deps));
+                    if let Some(previous) = inner.instances.get(id) {
+                        let mut old_policy = previous.config.git_sync();
+                        old_policy.paused = false;
+                        let mut new_policy = cfg.git_sync();
+                        new_policy.paused = false;
+                        if preserve_sync_history
+                            && old_policy == new_policy
+                            && previous.config.folder == cfg.folder
+                        {
+                            if let (Some(current), Some(old)) =
+                                (&instance.revisions, &previous.revisions)
+                            {
+                                current.inherit_sync_history(old);
+                            }
+                        }
+                    }
+                    instances.insert(id.clone(), instance);
                 }
             }
         }
         self.deps.space_prefixes.set(prefix_roots(&instances));
-        self.registry.swap(RoutingTable::build(instances.clone()));
+        retired.table = Some(self.registry.swap(RoutingTable::build(instances.clone())));
         inner.config = new_config;
-        inner.instances = instances;
+        let previous = std::mem::replace(&mut inner.instances, instances);
+        retired.instances.extend(previous.into_values());
         Ok(())
+    }
+
+    pub(super) fn change_git(
+        &self,
+        id: &str,
+        preserve_sync_history: bool,
+        change: impl FnOnce(&SpaceInstance, &mut SpaceConfig) -> Result<(), String>,
+    ) -> Result<(), ApiError> {
+        let mut retired = Retired::default();
+        let mut inner = self.state.lock().unwrap();
+        let instance = inner.instances.get(id).cloned().ok_or(ApiError::NotFound)?;
+        let repo = super::admin_api::syncable_repo(&instance)
+            .ok_or_else(|| ApiError::Internal("this space cannot sync".into()))?;
+        if instance.config.read_only {
+            return Err(ApiError::Internal("this space is read only".into()));
+        }
+        if let Some(engine) = &instance.revisions {
+            engine.quiesce_sync();
+        }
+        let mut new_config = inner.config.clone();
+        let result = (|| {
+            super::git_connection::begin_change(
+                &self.root,
+                id,
+                &repo,
+                instance.config.git_sync.clone(),
+            )
+            .map_err(ApiError::Internal)?;
+            change(&instance, new_config.spaces.get_mut(id).unwrap())
+                .map_err(ApiError::Internal)?;
+            super::git_connection::sync_git_config(&repo).map_err(ApiError::Internal)?;
+            self.apply_locked(
+                &mut inner,
+                new_config,
+                &mut retired,
+                Some(id),
+                preserve_sync_history,
+            )
+        })();
+        if result.is_err() {
+            super::git_connection::recover(&self.root, &mut inner.config)
+                .map_err(ApiError::Internal)?;
+            if let Some(engine) = &instance.revisions {
+                engine.set_sync_paused(instance.config.git_sync().paused);
+            }
+        } else if let Some(current) = inner.instances.get(id) {
+            if let Some(engine) = &current.revisions {
+                engine.set_sync_paused(current.config.git_sync().paused);
+            }
+        }
+        result
     }
 
     pub fn create(&self, mut cfg: SpaceConfig, should_seed: bool) -> Result<String, ApiError> {
         cfg.normalize();
+        let mut retired = Retired::default();
         let mut inner = self.state.lock().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         if cfg.folder.is_empty() {
@@ -250,7 +365,7 @@ impl MultiManager {
         })?;
         let mut new_config = inner.config.clone();
         new_config.spaces.insert(id.clone(), cfg.clone());
-        self.apply_locked(&mut inner, new_config)?;
+        self.apply_locked(&mut inner, new_config, &mut retired, None, true)?;
         if should_seed {
             seed_index(
                 &folder,
@@ -264,23 +379,30 @@ impl MultiManager {
 
     pub fn update(&self, id: &str, mut cfg: SpaceConfig) -> Result<(), ApiError> {
         cfg.normalize();
+        let mut retired = Retired::default();
         let mut inner = self.state.lock().unwrap();
         if !inner.config.spaces.contains_key(id) {
             return Err(ApiError::NotFound);
         }
+        cfg.git_sync = inner
+            .config
+            .spaces
+            .get(id)
+            .and_then(|space| space.git_sync.clone());
         let mut new_config = inner.config.clone();
         new_config.spaces.insert(id.to_string(), cfg);
-        self.apply_locked(&mut inner, new_config)
+        self.apply_locked(&mut inner, new_config, &mut retired, None, true)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), ApiError> {
+        let mut retired = Retired::default();
         let mut inner = self.state.lock().unwrap();
         if !inner.config.spaces.contains_key(id) {
             return Err(ApiError::NotFound);
         }
         let mut new_config = inner.config.clone();
         new_config.spaces.remove(id);
-        self.apply_locked(&mut inner, new_config)
+        self.apply_locked(&mut inner, new_config, &mut retired, None, true)
     }
 
     /// JSON view for GET /spaces: id -> { config,
@@ -348,6 +470,7 @@ impl MultiManager {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), ApiError> {
+        let mut retired = Retired::default();
         let mut inner = self.state.lock().unwrap();
         let Some(existing) = inner.config.spaces.get(id).cloned() else {
             return Err(ApiError::NotFound);
@@ -381,10 +504,11 @@ impl MultiManager {
                 message: e.to_string(),
             }])
         })?;
+        cfg.git_sync = existing.git_sync.clone();
         cfg.normalize();
         let mut new_config = inner.config.clone();
         new_config.spaces.insert(id.to_string(), cfg);
-        self.apply_locked(&mut inner, new_config)
+        self.apply_locked(&mut inner, new_config, &mut retired, None, true)
     }
 }
 
@@ -465,6 +589,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         }
     }

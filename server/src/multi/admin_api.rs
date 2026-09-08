@@ -3,6 +3,7 @@
 //! `/.spaces` surface (see `space_index`), which owns the session. Sessions use
 //! the same host-wide account cookie as every prefix-bound space.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, Request, State};
@@ -11,14 +12,16 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::{Authenticator, JwtAuthorizer, RequestAuthorizer};
 use crate::multi::access::UserTokenAuthorizer;
-use crate::multi::config::SpaceConfig;
+use crate::multi::config::{GitSyncMode, SpaceConfig};
+use crate::multi::instance::SpaceInstance;
 use crate::multi::manager::{ApiError, MultiManager};
 use crate::multi::users::{Profile, UserStore};
+use crate::revisions::{describe_sync_error, git, keys, redact_credentials, sync};
 use crate::router::run_blocking;
 
 pub struct AdminState {
@@ -203,7 +206,11 @@ async fn handle_create(
     Json(body): Json<CreateBody>,
 ) -> Response {
     let manager = state.manager.clone();
-    let CreateBody { seed_index, config } = body;
+    let CreateBody {
+        seed_index,
+        mut config,
+    } = body;
+    config.git_sync = None;
     match run_blocking(move || Ok(manager.create(config, seed_index))).await {
         Ok(Ok(id)) => Json(json!({ "id": id })).into_response(),
         Ok(Err(e)) => api_error(e),
@@ -255,6 +262,272 @@ async fn handle_delete(
     match run_blocking(move || Ok(manager.delete(&id))).await {
         Ok(Ok(())) => Json(json!({ "status": "ok" })).into_response(),
         Ok(Err(e)) => api_error(e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task failed").into_response(),
+    }
+}
+
+// --- Git sync (per-space) --------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatus {
+    remote_url: Option<String>,
+    remote_name: Option<String>,
+    branch: Option<String>,
+    credential_mode: GitSyncMode,
+    public_key: Option<String>,
+    fingerprint: Option<String>,
+    ahead: Option<usize>,
+    behind: Option<usize>,
+    sync: serde_json::Value,
+    last_attempt: Option<u64>,
+    last_success: Option<u64>,
+    version: u64,
+    enabled: bool,
+    paused: bool,
+    dirty: bool,
+    pull_interval_secs: u64,
+}
+
+fn rev_list_left_right(repo: &Path, left: &str, right: &str) -> Option<(usize, usize)> {
+    let out = git::run(
+        repo,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{left}...{right}"),
+        ],
+        &[],
+    )
+    .ok()?;
+    let mut parts = out.split_whitespace();
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+fn local_commit_count(repo: &Path) -> Option<usize> {
+    git::run(repo, &["rev-list", "--count", "HEAD"], &[])
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+}
+
+fn ahead_behind_status(
+    repo: &Path,
+    target: Option<&sync::RemoteTarget>,
+) -> (Option<usize>, Option<usize>) {
+    let Some(target) = target else {
+        return (local_commit_count(repo), None);
+    };
+    if let Ok((a, b)) = sync::ahead_behind(repo, &target.branch) {
+        return (Some(a), Some(b));
+    }
+    let tracking_ref = format!("refs/remotes/{}/{}", target.remote, target.branch);
+    if git::check(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &tracking_ref],
+        1,
+    )
+    .unwrap_or(false)
+    {
+        if let Some((a, b)) = rev_list_left_right(repo, &target.branch, &tracking_ref) {
+            return (Some(a), Some(b));
+        }
+    }
+    (local_commit_count(repo), None)
+}
+
+/// The repository these routes may touch. `resolve_folder` resolves upward,
+/// so on a space nested inside a larger repo it hands back the *enclosing*
+/// repository -- which `set_remote` would then write to. The store already
+/// refused that space (`auto_commit_allowed` is false), so ask it instead.
+pub(super) fn syncable_repo(instance: &SpaceInstance) -> Option<PathBuf> {
+    let store = instance.revisions.as_ref()?.store();
+    store.auto_commit_allowed().then(|| store.repo_root())?
+}
+
+/// Carries a `kind` alongside the usual `errors` array: the admin form has
+/// to tell "sync is impossible for this space" apart from "the request
+/// failed", and only the former is worth blocking a save over.
+fn not_syncable() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "errors": [{
+                "field": "revisions",
+                "message": "Git sync requires a managed repository of its own. Git sync is unavailable when the space repository contains server settings or keys; use a separate space folder.",
+            }],
+            "kind": "notSyncable",
+        })),
+    )
+        .into_response()
+}
+
+fn remote_url(repo: &Path, remote: &str) -> Option<String> {
+    git::run(
+        repo,
+        &["config", "--get", &format!("remote.{remote}.url")],
+        &[],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+}
+
+fn git_status(repo: &Path, server_root: &Path, id: &str, mode: GitSyncMode) -> GitStatus {
+    let target = sync::resolve_target(repo).ok();
+    let remote_url = target.as_ref().and_then(|t| remote_url(repo, &t.remote));
+    let (ahead, behind) = ahead_behind_status(repo, target.as_ref());
+    let public_key = keys::public_key(server_root, id);
+    let fingerprint = keys::fingerprint(server_root, id);
+    GitStatus {
+        remote_url,
+        remote_name: target.as_ref().map(|t| t.remote.clone()),
+        branch: target.as_ref().map(|t| t.branch.clone()),
+        credential_mode: mode,
+        public_key,
+        fingerprint,
+        ahead,
+        behind,
+        sync: json!({ "state": "idle" }),
+        last_attempt: None,
+        last_success: None,
+        version: 0,
+        enabled: !mode.is_off(),
+        paused: false,
+        dirty: false,
+        pull_interval_secs: 300,
+    }
+}
+
+async fn handle_git_status(
+    State(state): State<Arc<AdminState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(instance) = state.manager.instance(&id) else {
+        return api_error(ApiError::NotFound);
+    };
+    let Some(repo) = syncable_repo(&instance) else {
+        return not_syncable();
+    };
+    let root = state.manager.root().to_path_buf();
+    let engine = instance.revisions.clone();
+    let id_for_keys = id.clone();
+    let mode = instance.config.git_sync().mode;
+    let cadence = instance.config.git_sync().pull_interval_secs;
+    let result = run_blocking(move || {
+        let mut status = git_status(&repo, &root, &id_for_keys, mode);
+        if let Some(engine) = engine {
+            let snapshot = engine.sync_snapshot();
+            status.sync = serde_json::to_value(&snapshot.sync).unwrap();
+            status.last_attempt = snapshot.last_attempt;
+            status.last_success = snapshot.last_success;
+            status.version = snapshot.version;
+            status.enabled = snapshot.enabled;
+            status.paused = snapshot.paused;
+            status.dirty = snapshot.dirty;
+            status.ahead = snapshot.pending.or(status.ahead);
+            status.behind = snapshot.incoming.or(status.behind);
+        }
+        status.pull_interval_secs = cadence;
+        Ok(status)
+    })
+    .await;
+    match result {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub(super) fn classify_git_test_error(stderr: &str) -> (&'static str, String) {
+    // git echoes the whole remote URL on an HTTPS failure, credentials and
+    // all, and this message is rendered by the client.
+    let message = redact_credentials(stderr).trim().to_string();
+    let lower = message.to_ascii_lowercase();
+    let kind = if lower.contains("permission denied")
+        || lower.contains("authentication failed")
+        || (lower.contains("permission to") && lower.contains("denied"))
+        || lower.contains("write access to repository")
+        || lower.contains("not allowed to push")
+    {
+        "authFailed"
+    } else if lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("does not appear to be a git repository")
+    {
+        "notFound"
+    } else if lower.contains("could not resolve hostname")
+        || lower.contains("connection timed out")
+        || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("could not read from remote repository")
+    {
+        "unreachable"
+    } else if lower.contains("non-fast-forward") || lower.contains("[rejected]") {
+        "behind"
+    } else {
+        "other"
+    };
+    (kind, message)
+}
+
+async fn legacy_git_mutation() -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"kind":"draftRequired","errors":[{"field":"gitSync","message":"use a connection draft to change or check Git sync"}]}))).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SyncBody {
+    #[serde(default)]
+    _allow_unrelated: bool,
+}
+
+fn tick_outcome_json(outcome: sync::TickOutcome) -> serde_json::Value {
+    match outcome {
+        sync::TickOutcome::Idle => json!({ "outcome": "idle" }),
+        sync::TickOutcome::Merged => json!({ "outcome": "merged" }),
+        sync::TickOutcome::Pushed => json!({ "outcome": "pushed" }),
+        sync::TickOutcome::MergedAndPushed => json!({ "outcome": "mergedAndPushed" }),
+        sync::TickOutcome::Conflicted(paths) => {
+            json!({ "outcome": "conflicted", "paths": paths })
+        }
+    }
+}
+
+async fn handle_git_sync_now(
+    State(state): State<Arc<AdminState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(_body): Json<SyncBody>,
+) -> Response {
+    let Some(instance) = state.manager.instance(&id) else {
+        return api_error(ApiError::NotFound);
+    };
+    let Some(engine) = instance.revisions.clone() else {
+        return api_error(ApiError::Internal(
+            "git sync is not enabled for this space".into(),
+        ));
+    };
+    if syncable_repo(&instance).is_none() {
+        return not_syncable();
+    }
+    let result = run_blocking(move || Ok(engine.sync_now(false))).await;
+    match result {
+        Ok(Ok(outcome)) => Json(tick_outcome_json(outcome)).into_response(),
+        Ok(Err(e)) => {
+            let (kind, message) = describe_sync_error(&e);
+            let fallback = if message.is_empty() {
+                kind.clone()
+            } else {
+                message.clone()
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "errors": [{ "field": "", "message": fallback }],
+                    "kind": kind,
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task failed").into_response(),
     }
 }
@@ -568,6 +841,18 @@ fn admin_api_routes() -> Router<Arc<AdminState>> {
                 .patch(handle_patch)
                 .delete(handle_delete),
         )
+        .merge(super::git_connection::routes())
+        .route("/spaces/{id}/git", get(handle_git_status))
+        .route(
+            "/spaces/{id}/git/remote",
+            axum::routing::put(legacy_git_mutation),
+        )
+        .route(
+            "/spaces/{id}/git/key",
+            post(legacy_git_mutation).delete(legacy_git_mutation),
+        )
+        .route("/spaces/{id}/git/test", post(legacy_git_mutation))
+        .route("/spaces/{id}/git/sync", post(handle_git_sync_now))
         .route("/fs/dirs", get(handle_fs_dirs))
         .route("/server-info", get(handle_server_info))
         .route("/users", get(handle_list_users).post(handle_create_user))
@@ -785,6 +1070,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         };
         let inst = build_instance(
@@ -941,6 +1228,491 @@ mod tests {
         let resp = authed(router, "POST", "/api/spaces", body, cookie).await;
         assert_eq!(resp.status(), StatusCode::OK);
         body_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    fn git_run(repo: &std::path::Path, args: &[&str]) -> String {
+        crate::revisions::git::run(repo, args, &[]).unwrap()
+    }
+
+    fn space_folder(root: &std::path::Path, id: &str) -> std::path::PathBuf {
+        root.join("spaces").join(id)
+    }
+
+    #[tokio::test]
+    async fn legacy_git_mutations_are_unavailable() {
+        let (router, cookie, id, dir) = git_fixture().await;
+        let repo = space_folder(dir.path(), &id);
+        for (method, suffix, body) in [
+            ("PUT", "remote", r#"{"url":"git@example.test:notes.git"}"#),
+            ("POST", "key", "{}"),
+            ("DELETE", "key", "{}"),
+        ] {
+            let response = authed(
+                &router,
+                method,
+                &format!("/api/spaces/{id}/git/{suffix}"),
+                body,
+                &cookie,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(git::run(&repo, &["remote", "get-url", "origin"], &[]).is_err());
+        assert!(keys::public_key(dir.path(), &id).is_none());
+    }
+
+    async fn git_fixture() -> (axum::Router, String, String, tempfile::TempDir) {
+        git_fixture_with_mode("key").await
+    }
+
+    async fn git_fixture_with_mode(
+        mode: &str,
+    ) -> (axum::Router, String, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, _m, users) = admin_router(&dir);
+        let cookie = session_cookie(&users, "admin");
+        let id = create_space(
+            &router,
+            &cookie,
+            &format!(
+                r#"{{"name":"Git","binding":{{"prefix":"/git"}},"revisions":"managed",
+                "gitSync":{{"mode":"{mode}","pullIntervalSecs":0}},"seedIndex":false}}"#
+            ),
+        )
+        .await;
+        (router, cookie, id, dir)
+    }
+
+    #[tokio::test]
+    async fn status_reports_local_commit_count_before_the_first_fetch() {
+        let (router, cookie, id, dir) = git_fixture().await;
+        let repo = space_folder(dir.path(), &id);
+        std::fs::write(repo.join("note.md"), "a\n").unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@x.test",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+
+        let status = body_json(
+            authed(
+                &router,
+                "GET",
+                &format!("/api/spaces/{id}/git"),
+                "",
+                &cookie,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status["ahead"], 1, "{status}");
+        assert!(status["behind"].is_null(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn status_reports_zero_ahead_for_a_fresh_clone_not_its_whole_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, _m, users) = admin_router(&dir);
+        let cookie = session_cookie(&users, "admin");
+
+        let remote = tempfile::tempdir().unwrap();
+        git_run(remote.path(), &["init", "-q", "--bare"]);
+        let seed = tempfile::tempdir().unwrap();
+        git_run(
+            std::path::Path::new("."),
+            &[
+                "clone",
+                "-q",
+                remote.path().to_str().unwrap(),
+                seed.path().to_str().unwrap(),
+            ],
+        );
+        for i in 1..=3 {
+            std::fs::write(
+                seed.path().join(format!("f{i}.md")),
+                "x
+",
+            )
+            .unwrap();
+            git_run(seed.path(), &["add", "-A"]);
+            git_run(
+                seed.path(),
+                &[
+                    "-c",
+                    "user.email=t@x.test",
+                    "-c",
+                    "user.name=T",
+                    "commit",
+                    "-qm",
+                    &format!("c{i}"),
+                ],
+            );
+        }
+        let branch = git_run(seed.path(), &["symbolic-ref", "--short", "HEAD"])
+            .trim()
+            .to_string();
+        git_run(seed.path(), &["push", "-q", "origin", &branch]);
+
+        let clone = tempfile::tempdir().unwrap();
+        git_run(
+            std::path::Path::new("."),
+            &[
+                "clone",
+                "-q",
+                remote.path().to_str().unwrap(),
+                clone.path().to_str().unwrap(),
+            ],
+        );
+
+        let body = format!(
+            r#"{{"name":"Cloned","binding":{{"prefix":"/cloned"}},"revisions":"managed","folder":"{}","seedIndex":false}}"#,
+            clone.path().display()
+        );
+        let id = create_space(&router, &cookie, &body).await;
+
+        let status = body_json(
+            authed(
+                &router,
+                "GET",
+                &format!("/api/spaces/{id}/git"),
+                "",
+                &cookie,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status["ahead"], 0, "{status}");
+        assert_eq!(status["behind"], 0, "{status}");
+    }
+
+    async fn draft_request(
+        router: &axum::Router,
+        cookie: &str,
+        id: &str,
+        method: &str,
+        suffix: &str,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = authed(
+            router,
+            method,
+            &format!("/api/spaces/{id}/git{suffix}"),
+            &body.to_string(),
+            cookie,
+        )
+        .await;
+        let status = response.status();
+        let value = body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        value
+    }
+    #[tokio::test]
+    async fn draft_key_and_cancel_preserve_live_connection() {
+        let (router, cookie, id, dir) = git_fixture().await;
+        let repo = space_folder(dir.path(), &id);
+        git_run(
+            &repo,
+            &["remote", "add", "origin", "git@example.test:existing.git"],
+        );
+        let original = keys::generate(dir.path(), &id).unwrap();
+        let draft = draft_request(&router, &cookie, &id, "POST", "/draft", json!({})).await;
+        let suffix = format!("/draft/{}", draft["id"].as_str().unwrap());
+        let next = draft_request(
+            &router,
+            &cookie,
+            &id,
+            "POST",
+            &format!("{suffix}/key"),
+            json!({"version":draft["version"]}),
+        )
+        .await;
+        assert_ne!(next["publicKey"], original);
+        assert!(next.get("privateKey").is_none());
+        assert_eq!(keys::public_key(dir.path(), &id).unwrap(), original);
+        draft_request(&router, &cookie, &id, "DELETE", &suffix, json!({})).await;
+        assert_eq!(
+            git_run(&repo, &["remote", "get-url", "origin"]).trim(),
+            "git@example.test:existing.git"
+        );
+        assert_eq!(keys::public_key(dir.path(), &id).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn checked_draft_apply_pause_resume_and_disconnect() {
+        let (router, cookie, id, dir) = git_fixture().await;
+        let remote = tempfile::TempDir::new().unwrap();
+        git_run(remote.path(), &["init", "-q", "--bare"]);
+        let draft = draft_request(&router, &cookie, &id, "POST", "/draft", json!({})).await;
+        let suffix = format!("/draft/{}", draft["id"].as_str().unwrap());
+        let updated = draft_request(&router,&cookie,&id,"PUT",&suffix,json!({"version":draft["version"],"url":remote.path(),"mode":"manual","pullIntervalSecs":0})).await;
+        let checked = draft_request(
+            &router,
+            &cookie,
+            &id,
+            "POST",
+            &format!("{suffix}/test"),
+            json!({"version":updated["version"]}),
+        )
+        .await;
+        assert_eq!(checked["test"]["reachable"], true);
+        assert_eq!(checked["test"]["kind"], "emptyRepo");
+        assert!(git::run(
+            &space_folder(dir.path(), &id),
+            &["remote", "get-url", "origin"],
+            &[]
+        )
+        .is_err());
+        let stale = authed(
+            &router,
+            "POST",
+            &format!("/api/spaces/{id}/git{suffix}/apply"),
+            &json!({"version":updated["version"]}).to_string(),
+            &cookie,
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        draft_request(
+            &router,
+            &cookie,
+            &id,
+            "POST",
+            &format!("{suffix}/apply"),
+            json!({"version":checked["version"]}),
+        )
+        .await;
+        assert_eq!(
+            git_run(
+                &space_folder(dir.path(), &id),
+                &["remote", "get-url", "origin"]
+            )
+            .trim(),
+            remote.path().to_str().unwrap()
+        );
+        let repo = space_folder(dir.path(), &id);
+        std::fs::write(repo.join("Note.md"), "A note\n").unwrap();
+        git_run(&repo, &["add", "Note.md"]);
+        git_run(
+            &repo,
+            &[
+                "-c",
+                "user.name=Sample",
+                "-c",
+                "user.email=sample@example.test",
+                "commit",
+                "-qm",
+                "Create note",
+            ],
+        );
+        draft_request(&router, &cookie, &id, "POST", "/sync", json!({})).await;
+        let mut successful = draft_request(&router, &cookie, &id, "GET", "", json!({})).await;
+        for _ in 0..100 {
+            if successful["lastSuccess"].is_number() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            successful = draft_request(&router, &cookie, &id, "GET", "", json!({})).await;
+        }
+        assert!(successful["lastSuccess"].is_number(), "{successful}");
+        for (action, paused) in [("pause", true), ("resume", false)] {
+            draft_request(
+                &router,
+                &cookie,
+                &id,
+                "POST",
+                &format!("/{action}"),
+                json!({}),
+            )
+            .await;
+            let status = draft_request(&router, &cookie, &id, "GET", "", json!({})).await;
+            assert_eq!(status["paused"], paused);
+            assert_eq!(status["credentialMode"], "manual");
+            assert_eq!(status["lastSuccess"], successful["lastSuccess"]);
+        }
+        let response = authed(
+            &router,
+            "PATCH",
+            &format!("/api/spaces/{id}"),
+            r#"{"name":"Renamed","gitSync":{"mode":"key"}}"#,
+            &cookie,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = draft_request(&router, &cookie, &id, "GET", "", json!({})).await;
+        assert_eq!(status["credentialMode"], "manual");
+        draft_request(&router, &cookie, &id, "DELETE", "/connection", json!({})).await;
+        let status = draft_request(&router, &cookie, &id, "GET", "", json!({})).await;
+        assert_eq!(status["enabled"], false);
+        assert_eq!(
+            git_run(
+                &space_folder(dir.path(), &id),
+                &["remote", "get-url", "origin"]
+            )
+            .trim(),
+            remote.path().to_str().unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn draft_apply_rejects_external_remote_upstream_and_key_edits() {
+        for field in ["remote.origin.url", "branch.main.merge", "key"] {
+            let (router, cookie, id, dir) = git_fixture().await;
+            let repo = space_folder(dir.path(), &id);
+            git_run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+            git_run(
+                &repo,
+                &["remote", "add", "origin", "git@example.test:original.git"],
+            );
+            keys::generate(dir.path(), &id).unwrap();
+            let remote = tempfile::TempDir::new().unwrap();
+            git_run(remote.path(), &["init", "-q", "--bare"]);
+            let draft = draft_request(&router, &cookie, &id, "POST", "/draft", json!({})).await;
+            let suffix = format!("/draft/{}", draft["id"].as_str().unwrap());
+            let updated = draft_request(&router,&cookie,&id,"PUT",&suffix,json!({"version":draft["version"],"url":remote.path(),"mode":"manual","pullIntervalSecs":0})).await;
+            let checked = draft_request(
+                &router,
+                &cookie,
+                &id,
+                "POST",
+                &format!("{suffix}/test"),
+                json!({"version":updated["version"]}),
+            )
+            .await;
+            if field == "key" {
+                keys::generate(dir.path(), &id).unwrap();
+            } else {
+                git_run(
+                    &repo,
+                    &[
+                        "config",
+                        field,
+                        if field == "remote.origin.url" {
+                            "git@example.test:unseen.git"
+                        } else {
+                            "refs/heads/unseen"
+                        },
+                    ],
+                );
+            }
+            let before_config = std::fs::read(repo.join(".git/config")).unwrap();
+            let before_key = std::fs::read(keys::key_path(dir.path(), &id)).unwrap();
+            let response = authed(
+                &router,
+                "POST",
+                &format!("/api/spaces/{id}/git{suffix}/apply"),
+                &json!({"version":checked["version"]}).to_string(),
+                &cookie,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "unseen {field} edit must be preserved"
+            );
+            assert_eq!(
+                std::fs::read(repo.join(".git/config")).unwrap(),
+                before_config
+            );
+            assert_eq!(
+                std::fs::read(keys::key_path(dir.path(), &id)).unwrap(),
+                before_key
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_connection_editors_cannot_both_activate() {
+        let (router, cookie, id, dir) = git_fixture().await;
+        let remote = tempfile::TempDir::new().unwrap();
+        git_run(remote.path(), &["init", "-q", "--bare"]);
+        let mut candidates = Vec::new();
+        for _ in 0..2 {
+            let draft = draft_request(&router, &cookie, &id, "POST", "/draft", json!({})).await;
+            let suffix = format!("/draft/{}", draft["id"].as_str().unwrap());
+            let updated = draft_request(&router,&cookie,&id,"PUT",&suffix,json!({"version":draft["version"],"url":remote.path(),"mode":"manual","pullIntervalSecs":0})).await;
+            let checked = draft_request(
+                &router,
+                &cookie,
+                &id,
+                "POST",
+                &format!("{suffix}/test"),
+                json!({"version":updated["version"]}),
+            )
+            .await;
+            candidates.push((
+                format!("/api/spaces/{id}/git{suffix}/apply"),
+                json!({"version":checked["version"]}).to_string(),
+            ));
+        }
+        let (left, right) = tokio::join!(
+            authed(&router, "POST", &candidates[0].0, &candidates[0].1, &cookie),
+            authed(&router, "POST", &candidates[1].0, &candidates[1].1, &cookie)
+        );
+        assert!(
+            (left.status() == StatusCode::OK && right.status() == StatusCode::CONFLICT)
+                || (right.status() == StatusCode::OK && left.status() == StatusCode::CONFLICT)
+        );
+        assert_eq!(
+            git_run(
+                &space_folder(dir.path(), &id),
+                &["remote", "get-url", "origin"]
+            )
+            .trim(),
+            remote.path().to_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_connection_route_requires_admin() {
+        let (router, _cookie, id, _dir) = git_fixture().await;
+        for (method, suffix) in [
+            ("GET", ""),
+            ("POST", "/draft"),
+            ("PUT", "/draft/sample"),
+            ("DELETE", "/draft/sample"),
+            ("POST", "/draft/sample/key"),
+            ("POST", "/draft/sample/test"),
+            ("POST", "/draft/sample/apply"),
+            ("POST", "/pause"),
+            ("POST", "/resume"),
+            ("DELETE", "/connection"),
+            ("POST", "/sync"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("/api/spaces/{id}/git{suffix}"))
+                .header("host", "localhost")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                send(&router, request).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {suffix}"
+            );
+        }
+    }
+    #[test]
+    fn connection_error_classification_redacts_credentials() {
+        assert_eq!(
+            classify_git_test_error("Permission denied (publickey).").0,
+            "authFailed"
+        );
+        assert_eq!(
+            classify_git_test_error("! [rejected] main -> main (non-fast-forward)").0,
+            "behind"
+        );
+        assert_eq!(
+            classify_git_test_error("fatal: /missing does not appear to be a git repository").0,
+            "notFound"
+        );
+        let (_, message) =
+            classify_git_test_error("fatal: https://sample:secret@example.test/notes not found");
+        assert!(!message.contains("secret"));
     }
 
     #[tokio::test]

@@ -37,6 +37,23 @@ fn managed_marker(repo: &Path) -> bool {
     marker_state(repo).unwrap_or(false)
 }
 
+const IN_PROGRESS_MARKERS: [&str; 4] = [
+    "MERGE_HEAD",
+    "REBASE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+];
+
+/// `.git` is a file rather than a directory inside a worktree or submodule,
+/// so the real git dir has to be asked for rather than assumed.
+pub(crate) fn merge_in_progress(repo: &Path) -> bool {
+    let Ok(git_dir) = git::run(repo, &["rev-parse", "--absolute-git-dir"], &[]) else {
+        return false;
+    };
+    let git_dir = Path::new(git_dir.trim());
+    IN_PROGRESS_MARKERS.iter().any(|m| git_dir.join(m).exists())
+}
+
 /// `None` when the key has never been set; `Some` reflects its current value.
 /// A user-cleared `false` must stay `false` on re-open, not be re-marked.
 fn marker_state(repo: &Path) -> Option<bool> {
@@ -171,6 +188,9 @@ impl RevisionStore {
         }
         if self.head_exists() && !git::check(&repo, &["symbolic-ref", "--quiet", "HEAD"], 1)? {
             return Err("HEAD is detached; auto-commit paused".to_string());
+        }
+        if merge_in_progress(&repo) {
+            return Err("merge in progress; auto-commit paused".to_string());
         }
         Ok(repo)
     }
@@ -594,6 +614,39 @@ mod tests {
         assert!(store
             .commit_batch("A", "a@x", "second", &["a.md".into()])
             .is_err());
+    }
+
+    #[test]
+    fn merge_in_progress_pauses_commits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RevisionStore::open(dir.path(), RevisionsMode::Managed).unwrap();
+        std::fs::write(dir.path().join("note.md"), "base\n").unwrap();
+        store
+            .commit_batch("A", "a@x.test", "base", &["note.md".into()])
+            .unwrap();
+
+        git_out(dir.path(), &["checkout", "-b", "other"]);
+        std::fs::write(dir.path().join("note.md"), "theirs\n").unwrap();
+        store
+            .commit_batch("B", "b@x.test", "theirs", &["note.md".into()])
+            .unwrap();
+        git_out(dir.path(), &["checkout", "-"]);
+        std::fs::write(dir.path().join("note.md"), "ours\n").unwrap();
+        store
+            .commit_batch("A", "a@x.test", "ours", &["note.md".into()])
+            .unwrap();
+
+        // Leaves MERGE_HEAD and conflict markers in the working tree.
+        let _ = git::run(dir.path(), &["merge", "other"], &[]);
+        assert!(merge_in_progress(dir.path()));
+
+        let err = store
+            .commit_batch("A", "a@x.test", "should not land", &["note.md".into()])
+            .unwrap_err();
+        assert!(err.contains("merge"), "got: {err}");
+
+        let log = git_out(dir.path(), &["log", "--oneline"]);
+        assert!(!log.contains("should not land"));
     }
 
     #[test]

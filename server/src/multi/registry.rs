@@ -66,8 +66,13 @@ impl Registry {
     pub fn current(&self) -> Arc<RoutingTable> {
         self.0.read().expect("registry lock poisoned").clone()
     }
-    pub fn swap(&self, table: RoutingTable) {
-        *self.0.write().expect("registry lock poisoned") = Arc::new(table);
+    /// Returns the table it replaced, so a caller that must control *when*
+    /// the outgoing instances are dropped can hold on to it.
+    pub fn swap(&self, table: RoutingTable) -> Arc<RoutingTable> {
+        std::mem::replace(
+            &mut *self.0.write().expect("registry lock poisoned"),
+            Arc::new(table),
+        )
     }
 }
 
@@ -103,11 +108,14 @@ mod tests {
                 space_ignore: String::new(),
                 log_push: false,
                 revisions: Default::default(),
+                git_sync: None,
+                revisions_commit: None,
                 extra: Default::default(),
             },
             prefix,
             status: InstanceStatus::Running,
             router: None,
+            revisions: None,
         })
     }
 

@@ -57,6 +57,7 @@ struct HashCache {
 /// `/.fs` writes.
 #[derive(Default)]
 pub struct FsGuard {
+    pub mutation: RwLock<()>,
     cache: RwLock<HashCache>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     expected_writes: Mutex<HashMap<(String, String), ExpectedWrite>>,

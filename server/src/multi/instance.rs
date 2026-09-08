@@ -160,15 +160,16 @@ impl ServerControlFileFilter {
         let Some(name) = components.next() else {
             return false;
         };
-        components.next().is_none()
-            && matches!(
-                name,
-                "users.json"
-                    | "users.json.tmp"
-                    | "spaces.json"
-                    | "spaces.json.tmp"
-                    | crate::auth::MULTI_AUTH_FILE_NAME
-            )
+        matches!(name, "git-keys" | "git-drafts" | "git-connections")
+            || components.next().is_none()
+                && matches!(
+                    name,
+                    "users.json"
+                        | "users.json.tmp"
+                        | "spaces.json"
+                        | "spaces.json.tmp"
+                        | crate::auth::MULTI_AUTH_FILE_NAME
+                )
     }
 }
 
@@ -230,6 +231,10 @@ pub struct SpaceInstance {
     pub status: InstanceStatus,
     /// `None` when errored.
     pub router: Option<axum::Router>,
+    /// `None` when errored, or when the space is not managed-revisions. The
+    /// admin git-sync routes reach the live engine through this rather than
+    /// through the space's own router, which they are not nested inside.
+    pub revisions: Option<Arc<crate::revisions::RevisionEngine>>,
 }
 
 /// Resolve a space's folder: empty -> `<root>/spaces/<id>`, `"."` -> `<root>`
@@ -350,13 +355,17 @@ pub fn build_instance(id: &str, config: &SpaceConfig, deps: &InstanceDeps) -> Sp
         _ => String::new(),
     };
     match try_build_state(id, config, &prefix, deps) {
-        Ok(state) => SpaceInstance {
-            id: id.to_string(),
-            config: config.clone(),
-            prefix,
-            status: InstanceStatus::Running,
-            router: Some(crate::build_router(Arc::new(state))),
-        },
+        Ok(state) => {
+            let revisions = state.revisions.clone();
+            SpaceInstance {
+                id: id.to_string(),
+                config: config.clone(),
+                prefix,
+                status: InstanceStatus::Running,
+                router: Some(crate::build_router(Arc::new(state))),
+                revisions,
+            }
+        }
         Err(reason) => {
             tracing::warn!("space {id} is errored: {reason}");
             SpaceInstance {
@@ -365,6 +374,7 @@ pub fn build_instance(id: &str, config: &SpaceConfig, deps: &InstanceDeps) -> Sp
                 prefix,
                 status: InstanceStatus::Errored(reason),
                 router: None,
+                revisions: None,
             }
         }
     }
@@ -524,8 +534,51 @@ fn try_build_state(
         crate::WatchMode::from_env(),
         fs_guard.clone(),
     );
-    let revisions = crate::revisions::RevisionStore::open(&folder, config.revisions).map(|store| {
-        crate::revisions::RevisionEngine::start(store, fs_events.as_ref().map(|tx| tx.subscribe()))
+    let sync_settings = {
+        let gs = config.git_sync();
+        if !gs.mode.is_off()
+            && config.revisions == silverbullet_server_common::RevisionsMode::Managed
+        {
+            Some(crate::revisions::SyncSettings {
+                server_root: deps.root.clone(),
+                space_id: id.to_string(),
+                mode: gs.mode,
+                paused: gs.paused
+                    || config.read_only
+                    || deps
+                        .root
+                        .canonicalize()
+                        .ok()
+                        .zip(folder.canonicalize().ok())
+                        .is_some_and(|(root, folder)| root.starts_with(folder)),
+                pull_interval: gs.effective_pull_interval(),
+            })
+        } else {
+            None
+        }
+    };
+    let (quiet, max_interval) = config.revisions_commit().effective();
+    let store = crate::revisions::RevisionStore::open(&folder, config.revisions).filter(|store| {
+        !matches!(&deps.auth, InstanceAuth::Accounts { .. })
+            || !store
+                .repo_root()
+                .and_then(|repo| repo.canonicalize().ok())
+                .zip(deps.root.canonicalize().ok())
+                .is_some_and(|(repo, root)| root.starts_with(repo))
+    });
+    let revisions_mode = if store.is_some() {
+        config.revisions
+    } else {
+        silverbullet_server_common::RevisionsMode::Disabled
+    };
+    let revisions = store.map(|store| {
+        crate::revisions::RevisionEngine::start_with_fs_guard(
+            store,
+            fs_events.as_ref().map(|tx| tx.subscribe()),
+            crate::revisions::Timing::from_parts(quiet, max_interval),
+            sync_settings,
+            fs_guard.clone(),
+        )
     });
 
     Ok(ServerState {
@@ -546,7 +599,7 @@ fn try_build_state(
             },
             disable_service_worker: deps.disable_service_worker,
             sync_protocol_version: 2,
-            revisions: config.revisions,
+            revisions: revisions_mode,
         },
         space_prefixes: deps.space_prefixes.clone(),
         space_folder_path: folder_str,
@@ -628,6 +681,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         }
     }
@@ -846,6 +901,8 @@ mod tests {
             space_ignore: String::new(),
             log_push: false,
             revisions: Default::default(),
+            git_sync: None,
+            revisions_commit: None,
             extra: Default::default(),
         }
     }
@@ -1303,6 +1360,10 @@ mod tests {
         std::fs::write(dir.path().join("spaces.json"), "{}").unwrap();
         std::fs::write(dir.path().join(crate::auth::MULTI_AUTH_FILE_NAME), "secret").unwrap();
         std::fs::write(dir.path().join("note.md"), "visible").unwrap();
+        for directory in ["git-keys", "git-drafts", "git-connections"] {
+            std::fs::create_dir(dir.path().join(directory)).unwrap();
+            std::fs::write(dir.path().join(directory).join("sample"), "private state").unwrap();
+        }
         let authenticator = Arc::new(Authenticator::from_secret_bytes(vec![8; 32], "v1".into()));
         deps.auth = InstanceAuth::Accounts {
             users: store.clone(),
@@ -1310,13 +1371,20 @@ mod tests {
             session: SessionPolicy::default(),
         };
 
-        let cfg = space_users_model(
+        let mut cfg = space_users_model(
             Binding::Prefix { prefix: "/".into() },
             SpaceAccess::None,
             Default::default(),
             dir.path().to_str().unwrap(),
         );
-        let router = build_instance("root", &cfg, &deps).router.unwrap();
+        cfg.revisions = silverbullet_server_common::RevisionsMode::Managed;
+        let instance = build_instance("root", &cfg, &deps);
+        assert!(instance.revisions.is_none());
+        assert!(
+            crate::revisions::git::run(dir.path(), &["rev-parse", "--verify", "HEAD"], &[])
+                .is_err()
+        );
+        let router = instance.router.unwrap();
         let version = store.credential_version("admin").unwrap();
         let jwt = authenticator
             .issue_jwt_with_version("admin", version, 3600)
@@ -1343,6 +1411,10 @@ mod tests {
             "/.fs/users.json",
             "/.fs/spaces.json",
             "/.fs/.silverbullet.session.json",
+            "/.fs/git-keys/sample",
+            "/.fs/git-drafts/sample",
+            "/.fs/git-connections/sample",
+            "/.revisions/_sync",
         ] {
             assert_eq!(
                 router.clone().oneshot(get(path)).await.unwrap().status(),

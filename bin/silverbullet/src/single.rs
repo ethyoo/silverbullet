@@ -63,6 +63,8 @@ fn synthesize(config: &Config, shell_env: ShellConfig) -> SpaceConfig {
         space_ignore: config.gitignore.clone(),
         log_push: config.log_push,
         revisions: config.revisions,
+        git_sync: None,
+        revisions_commit: None,
         extra: Default::default(),
     }
 }

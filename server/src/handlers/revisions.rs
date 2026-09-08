@@ -58,6 +58,117 @@ where
     }
 }
 
+pub async fn handle_sync_status(State(state): State<Arc<ServerState>>) -> Response {
+    let Some(engine) = state.revisions.clone() else {
+        return disabled();
+    };
+    let Ok(mut snapshot) = tokio::task::spawn_blocking(move || engine.sync_snapshot()).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    snapshot.sync = snapshot.sync.without_message();
+    axum::Json(snapshot).into_response()
+}
+
+pub async fn handle_sync_now(State(state): State<Arc<ServerState>>) -> Response {
+    if state.boot_config.read_only {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(engine) = state.revisions.clone() else {
+        return disabled();
+    };
+    engine.request_sync();
+    let Ok(mut snapshot) = tokio::task::spawn_blocking(move || engine.sync_snapshot()).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    snapshot.sync = snapshot.sync.without_message();
+    (StatusCode::ACCEPTED, axum::Json(snapshot)).into_response()
+}
+
+pub async fn handle_conflicts(State(state): State<Arc<ServerState>>) -> Response {
+    let Some(engine) = state.revisions.clone() else {
+        return disabled();
+    };
+    match tokio::task::spawn_blocking(move || engine.conflicts()).await {
+        Ok(Ok(conflicts)) => axum::Json(conflicts).into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error":"ConflictStatusUnavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ConflictSideQuery {
+    generation: Option<String>,
+}
+
+pub async fn handle_conflict_side(
+    State(state): State<Arc<ServerState>>,
+    Path((id, side)): Path<(String, String)>,
+    Query(query): Query<ConflictSideQuery>,
+) -> Response {
+    use crate::revisions::conflicts::ResolveError;
+    let Some(engine) = state.revisions.clone() else {
+        return disabled();
+    };
+    let Some(generation) = query.generation else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let filename = match side.as_str() {
+        "local" => "attachment; filename=conflict-local",
+        "remote" => "attachment; filename=conflict-remote",
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match tokio::task::spawn_blocking(move || engine.conflict_side(&id, &generation, &side)).await {
+        Ok(Ok(bytes)) => (
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Disposition", filename),
+                ("Cache-Control", "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(ResolveError::Stale)) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error":"StaleConflict"})),
+        )
+            .into_response(),
+        Ok(Err(ResolveError::Unsupported)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub async fn handle_resolve_conflict(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    axum::Extension(actor): axum::Extension<crate::auth::Actor>,
+    axum::Json(request): axum::Json<crate::revisions::conflicts::ResolveRequest>,
+) -> Response {
+    use crate::revisions::conflicts::ResolveError;
+    if state.boot_config.read_only {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(engine) = state.revisions.clone() else {
+        return disabled();
+    };
+    let result =
+        tokio::task::spawn_blocking(move || engine.resolve_conflict(&id, &request, &actor)).await;
+    let (status, error) = match result {
+        Ok(Ok(conflicts)) => return axum::Json(conflicts).into_response(),
+        Ok(Err(ResolveError::Stale)) => (StatusCode::CONFLICT, "StaleConflict"),
+        Ok(Err(ResolveError::PreconditionRequired)) => {
+            (StatusCode::PRECONDITION_REQUIRED, "ContentRevisionRequired")
+        }
+        Ok(Err(ResolveError::Unsupported)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "UnsupportedResolution")
+        }
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "ResolutionFailed"),
+    };
+    (status, axum::Json(serde_json::json!({"error":error}))).into_response()
+}
+
 pub async fn handle_space_log(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<HistoryQuery>,
@@ -80,12 +191,23 @@ pub async fn handle_space_log(
         };
     }
     let limit = limit_of(&q);
+    let history_for_sync = history.clone();
     let result = run_blocking(move || {
         read::space_log(history.store(), q.before.as_deref(), limit, q.q.as_deref())
     })
     .await;
     match result {
-        Ok(log) => axum::Json(log).into_response(),
+        Ok(log) => {
+            let mut body = serde_json::to_value(log).unwrap_or_default();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "sync".into(),
+                    serde_json::to_value(history_for_sync.sync_state().without_message())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            axum::Json(body).into_response()
+        }
         Err(e) => revisions_error(e),
     }
 }
@@ -227,7 +349,12 @@ mod tests {
         store
             .commit_batch("bob", "bob@x", "edit note", &["note.md".into()])
             .unwrap();
-        state.revisions = Some(crate::revisions::RevisionEngine::start(store, None));
+        state.revisions = Some(crate::revisions::RevisionEngine::start(
+            store,
+            None,
+            crate::revisions::Timing::default(),
+            None,
+        ));
         state
     }
 
@@ -244,6 +371,84 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn conflict_endpoints_enforce_preconditions_and_download_exact_stage_bytes() {
+        let (_remote, _seed, work) = crate::revisions::sync::tests::conflict_fixture(
+            "Café.bin",
+            Some(b"base\0"),
+            b"local\0",
+            b"remote\0",
+        );
+        let mut state = test_state();
+        let store =
+            crate::revisions::RevisionStore::open(work.path(), RevisionsMode::Managed).unwrap();
+        state.revisions = Some(crate::revisions::RevisionEngine::start(
+            store,
+            None,
+            crate::revisions::Timing::default(),
+            None,
+        ));
+        let router = crate::build_router(Arc::new(state));
+        let (status, listing) = get_json(router.clone(), "/.revisions/_conflicts").await;
+        assert_eq!(status, StatusCode::OK);
+        let conflict = &listing["conflicts"][0];
+        let id = conflict["id"].as_str().unwrap();
+        let generation = listing["generation"].as_str().unwrap();
+        assert_eq!(conflict["path"], "Café.bin");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/.revisions/_conflicts/{id}/remote?generation={generation}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=conflict-remote"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"remote\0"
+        );
+        let request = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/.revisions/_conflicts/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request(
+                serde_json::json!({"generation":generation,"action":"remote"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        let response = router.clone().oneshot(request(serde_json::json!({"generation":generation,"action":"remote","contentRevision":"old"}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(work.path().join("Café.bin")).unwrap(),
+            b"local\0"
+        );
+        let response = router.oneshot(request(serde_json::json!({"generation":generation,"action":"remote","contentRevision":conflict["contentRevision"]}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(work.path().join("Café.bin")).unwrap(),
+            b"remote\0"
+        );
     }
 
     #[tokio::test]
@@ -402,6 +607,19 @@ mod tests {
         assert_eq!(json["commits"][0]["files"][0]["status"], "modified");
     }
 
+    #[tokio::test]
+    async fn space_log_includes_sync_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(history_state(&dir));
+        let (status, json) = get_json(crate::build_router(state), "/.revisions/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json["sync"].is_null() || json["sync"].is_object(),
+            "sync must be null-or-object: {json}"
+        );
+        assert_eq!(json["sync"]["state"], "idle");
+    }
+
     async fn post_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let resp = router
             .oneshot(
@@ -453,7 +671,12 @@ mod tests {
             .unwrap();
         let store =
             crate::revisions::RevisionStore::open(dir.path(), RevisionsMode::Unmanaged).unwrap();
-        state.revisions = Some(crate::revisions::RevisionEngine::start(store, None));
+        state.revisions = Some(crate::revisions::RevisionEngine::start(
+            store,
+            None,
+            crate::revisions::Timing::default(),
+            None,
+        ));
 
         let (status, _) = post_json(crate::build_router(Arc::new(state)), "/.revisions/").await;
 
@@ -541,7 +764,12 @@ mod tests {
         let mut state = test_state();
         let store =
             crate::revisions::RevisionStore::open(dir.path(), RevisionsMode::Unmanaged).unwrap();
-        state.revisions = Some(crate::revisions::RevisionEngine::start(store, None));
+        state.revisions = Some(crate::revisions::RevisionEngine::start(
+            store,
+            None,
+            crate::revisions::Timing::default(),
+            None,
+        ));
         let resp = crate::build_router(Arc::new(state))
             .oneshot(
                 Request::builder()

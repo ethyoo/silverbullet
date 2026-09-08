@@ -57,6 +57,104 @@ pub struct ShellSettings {
     pub whitelist: Vec<String>,
 }
 
+/// How this space authenticates to its git remote — and, because `Off` is a
+/// mode, whether it syncs at all. The admin picks this; it is never derived
+/// from whether a key file happens to exist on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitSyncMode {
+    #[default]
+    Off,
+    Key,
+    Manual,
+}
+
+impl GitSyncMode {
+    pub fn is_off(self) -> bool {
+        matches!(self, GitSyncMode::Off)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSyncConfig {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub mode: GitSyncMode,
+    #[serde(default = "default_pull_interval")]
+    pub pull_interval_secs: u64,
+}
+
+fn default_pull_interval() -> u64 {
+    300
+}
+
+impl Default for GitSyncConfig {
+    fn default() -> Self {
+        GitSyncConfig {
+            paused: false,
+            mode: GitSyncMode::Off,
+            pull_interval_secs: default_pull_interval(),
+        }
+    }
+}
+
+impl GitSyncConfig {
+    pub const MIN_PULL_INTERVAL_SECS: u64 = 60;
+
+    pub fn effective_pull_interval(&self) -> Option<std::time::Duration> {
+        match self.pull_interval_secs {
+            0 => None,
+            n => Some(std::time::Duration::from_secs(
+                n.max(Self::MIN_PULL_INTERVAL_SECS),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitTiming {
+    #[serde(default = "default_quiet_secs")]
+    pub quiet_secs: u64,
+    #[serde(default = "default_max_interval_secs")]
+    pub max_interval_secs: u64,
+}
+
+fn default_quiet_secs() -> u64 {
+    30
+}
+fn default_max_interval_secs() -> u64 {
+    300
+}
+
+impl Default for CommitTiming {
+    fn default() -> Self {
+        CommitTiming {
+            quiet_secs: default_quiet_secs(),
+            max_interval_secs: default_max_interval_secs(),
+        }
+    }
+}
+
+impl CommitTiming {
+    pub const MIN_QUIET_SECS: u64 = 5;
+    pub const MIN_MAX_INTERVAL_SECS: u64 = 30;
+
+    pub fn effective(&self) -> (std::time::Duration, std::time::Duration) {
+        let quiet = self.quiet_secs.max(Self::MIN_QUIET_SECS);
+        let max = self
+            .max_interval_secs
+            .max(Self::MIN_MAX_INTERVAL_SECS)
+            .max(quiet);
+        (
+            std::time::Duration::from_secs(quiet),
+            std::time::Duration::from_secs(max),
+        )
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -138,6 +236,10 @@ pub struct SpaceConfig {
     pub log_push: bool,
     #[serde(default)]
     pub revisions: silverbullet_server_common::RevisionsMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sync: Option<GitSyncConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revisions_commit: Option<CommitTiming>,
     /// Fields written by newer versions, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -146,6 +248,14 @@ pub struct SpaceConfig {
 impl SpaceConfig {
     pub fn access(&self) -> SpaceAccess {
         self.access.unwrap_or_default()
+    }
+
+    pub fn git_sync(&self) -> GitSyncConfig {
+        self.git_sync.clone().unwrap_or_default()
+    }
+
+    pub fn revisions_commit(&self) -> CommitTiming {
+        self.revisions_commit.clone().unwrap_or_default()
     }
 
     /// Folds a legacy `public` flag into `access` and drops it, so everything
@@ -203,21 +313,42 @@ impl MultiConfig {
     /// Atomically persist: write `<path>.tmp` (0600 on unix), then rename over
     /// `path`.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
         let json = self.to_json_string()?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
             .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-                // The file holds secrets; a failure to tighten permissions is
-                // worth surfacing, but the save still proceeds.
-                tracing::warn!("could not set 0600 on {}: {e}", tmp.display());
-            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("could not protect {}: {e}", tmp.display()))?;
         }
+        file.write_all(json.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
+        drop(file);
         std::fs::rename(&tmp, path)
-            .map_err(|e| format!("could not persist {}: {e}", path.display()))
+            .map_err(|e| format!("could not persist {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| format!("could not flush {}: {e}", parent.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -491,5 +622,116 @@ mod tests {
             again.spaces["id-managed"].revisions,
             silverbullet_server_common::RevisionsMode::Managed
         );
+    }
+
+    #[test]
+    fn git_sync_absent_reads_as_off_and_is_not_written_back() {
+        let json = r#"{"a":{"name":"A","binding":{"prefix":"/a"},"revisions":"managed"}}"#;
+        let cfg = MultiConfig::from_json(json).unwrap();
+        let space = cfg.spaces.get("a").unwrap();
+        assert_eq!(space.git_sync().mode, GitSyncMode::Off);
+        assert!(!serde_json::to_string(space).unwrap().contains("gitSync"));
+    }
+
+    #[test]
+    fn git_sync_mode_round_trips_in_lowercase() {
+        let json = r#"{"a":{"name":"A","binding":{"prefix":"/a"},"revisions":"managed",
+                        "gitSync":{"mode":"manual","pullIntervalSecs":600}}}"#;
+        let cfg = MultiConfig::from_json(json).unwrap();
+        assert_eq!(cfg.spaces["a"].git_sync().mode, GitSyncMode::Manual);
+
+        let out = serde_json::to_string(&cfg.spaces["a"]).unwrap();
+        assert!(out.contains(r#""mode":"manual""#), "{out}");
+
+        let again = MultiConfig::from_json(&serde_json::to_string(&cfg.spaces).unwrap()).unwrap();
+        assert_eq!(again.spaces["a"].git_sync().mode, GitSyncMode::Manual);
+    }
+
+    #[test]
+    fn a_git_sync_block_without_a_mode_is_off() {
+        let json = r#"{"a":{"name":"A","binding":{"prefix":"/a"},"revisions":"managed",
+                        "gitSync":{"pullIntervalSecs":600}}}"#;
+        let cfg = MultiConfig::from_json(json).unwrap();
+        assert_eq!(cfg.spaces["a"].git_sync().mode, GitSyncMode::Off);
+        assert_eq!(cfg.spaces["a"].git_sync().pull_interval_secs, 600);
+    }
+
+    #[test]
+    fn pull_interval_is_floored_but_zero_disables_polling() {
+        let below = GitSyncConfig {
+            paused: false,
+            mode: GitSyncMode::Key,
+            pull_interval_secs: 5,
+        };
+        assert_eq!(
+            below.effective_pull_interval(),
+            Some(std::time::Duration::from_secs(60))
+        );
+
+        let normal = GitSyncConfig {
+            paused: false,
+            mode: GitSyncMode::Key,
+            pull_interval_secs: 900,
+        };
+        assert_eq!(
+            normal.effective_pull_interval(),
+            Some(std::time::Duration::from_secs(900))
+        );
+
+        let never = GitSyncConfig {
+            paused: false,
+            mode: GitSyncMode::Manual,
+            pull_interval_secs: 0,
+        };
+        assert_eq!(never.effective_pull_interval(), None);
+    }
+
+    #[test]
+    fn commit_timing_defaults_match_the_existing_constants() {
+        let json = r#"{"a":{"name":"A","binding":{"prefix":"/a"},"revisions":"managed"}}"#;
+        let cfg = MultiConfig::from_json(json).unwrap();
+        let space = cfg.spaces.get("a").unwrap();
+        let (quiet, max) = space.revisions_commit().effective();
+        assert_eq!(quiet, std::time::Duration::from_secs(30));
+        assert_eq!(max, std::time::Duration::from_secs(300));
+        assert!(!serde_json::to_string(space)
+            .unwrap()
+            .contains("revisionsCommit"));
+    }
+
+    #[test]
+    fn commit_timing_is_clamped_into_coherence() {
+        // A zero quiet period would commit mid-keystroke-burst.
+        let (quiet, _) = CommitTiming {
+            quiet_secs: 0,
+            max_interval_secs: 300,
+        }
+        .effective();
+        assert_eq!(quiet, std::time::Duration::from_secs(5));
+
+        // A maximum below the debounce is incoherent; it floors at the quiet period.
+        let (quiet, max) = CommitTiming {
+            quiet_secs: 120,
+            max_interval_secs: 10,
+        }
+        .effective();
+        assert_eq!(quiet, std::time::Duration::from_secs(120));
+        assert_eq!(max, std::time::Duration::from_secs(120));
+
+        // And never below the absolute floor.
+        let (_, max) = CommitTiming {
+            quiet_secs: 5,
+            max_interval_secs: 1,
+        }
+        .effective();
+        assert_eq!(max, std::time::Duration::from_secs(30));
+
+        let (quiet, max) = CommitTiming {
+            quiet_secs: 120,
+            max_interval_secs: 900,
+        }
+        .effective();
+        assert_eq!(quiet, std::time::Duration::from_secs(120));
+        assert_eq!(max, std::time::Duration::from_secs(900));
     }
 }

@@ -35,15 +35,18 @@ where
     }
 }
 
-/// Paths here have the space's URL prefix already stripped by the multi-space
-/// dispatcher, so they always start at `/.`.
-///
-/// Revisions need `Write` in both directions rather than `Read`: publishing a
-/// space's current content is not publishing every revision it ever had, and
-/// the client already drops its whole revisions surface in read-only mode, so
-/// this keeps API and UI consistent without a second authorization axis.
+/// Publishing current content does not publish its history; history reads
+/// require Write, while sync metadata is available to authenticated readers.
 pub(crate) fn required_level(method: &Method, path: &str) -> AccessLevel {
     let safe = matches!(*method, Method::GET | Method::HEAD);
+    if safe
+        && (matches!(path, "/.revisions/_sync" | "/.revisions/_conflicts")
+            || (path.starts_with("/.revisions/_conflicts/")
+                && path.split('/').count() == 5
+                && matches!(path.rsplit('/').next(), Some("local" | "remote"))))
+    {
+        return AccessLevel::Read;
+    }
 
     if path.starts_with("/.shell")
         || path.starts_with("/.proxy/")
@@ -123,10 +126,9 @@ pub(crate) fn cross_origin_refused(
     }
 }
 
-/// Reject requests below the route's required access level. When no
-/// authorizer is configured the server is open and trusted at `Write`.
-/// Either way, inserts an `Extension<Actor>` carrying the verified identity
-/// (if any) and its level so downstream handlers can attribute writes to it.
+#[derive(Clone)]
+pub(crate) struct RevisionAccess(pub bool);
+
 async fn require_authorization(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
     mut req: Request,
@@ -154,6 +156,10 @@ async fn require_authorization(
     let level = grant.unwrap_or_else(|| state.access_policy.level_for(username.as_deref()));
     let is_account = username.is_some() || grant.is_some();
 
+    if req.uri().path().starts_with("/.revisions") && !is_account {
+        return refuse(&state, false);
+    }
+
     if level < required_level(req.method(), req.uri().path()) {
         return refuse(&state, is_account);
     }
@@ -166,6 +172,7 @@ async fn require_authorization(
             .into_response();
     }
 
+    req.extensions_mut().insert(RevisionAccess(is_account));
     let profile = state.identity.resolve(username.as_deref());
     req.extensions_mut().insert(actor_from(profile, level));
     next.run(req).await
@@ -243,6 +250,19 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             post(fs::handle_fs_reconcile).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/.events", get(crate::handlers::events::handle_events))
+        .route(
+            "/.revisions/_sync",
+            get(revisions::handle_sync_status).post(revisions::handle_sync_now),
+        )
+        .route("/.revisions/_conflicts", get(revisions::handle_conflicts))
+        .route(
+            "/.revisions/_conflicts/{id}",
+            post(revisions::handle_resolve_conflict).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/.revisions/_conflicts/{id}/{side}",
+            get(revisions::handle_conflict_side),
+        )
         .route(
             "/.revisions/",
             get(revisions::handle_space_log)
@@ -762,6 +782,76 @@ mod auth_tests {
         fn level_for(&self, _username: Option<&str>) -> AccessLevel {
             self.0
         }
+    }
+
+    #[tokio::test]
+    async fn sync_metadata_is_readable_to_members_but_mutations_require_write() {
+        let mut state = test_state();
+        state.authorizer = Some(Arc::new(AsUser("reader")));
+        state.access_policy = Arc::new(FixedPolicy(AccessLevel::Read));
+        let (engine, _dir) = crate::revisions::engine::engine_with_sync_for_test();
+        state.revisions = Some(engine);
+        let router = crate::build_router(Arc::new(state));
+        for path in ["/.revisions/_sync", "/.revisions/_conflicts"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    struct Anonymous;
+    impl RequestAuthorizer for Anonymous {
+        fn authorize(&self, _: &AuthContext) -> Option<AuthOutcome> {
+            Some(AuthOutcome::anonymous())
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_public_visitors_cannot_read_sync_metadata() {
+        let mut state = test_state();
+        state.authorizer = Some(Arc::new(Anonymous));
+        state.access_policy = Arc::new(FixedPolicy(AccessLevel::Read));
+        let router = crate::build_router(Arc::new(state));
+        for path in ["/.revisions/_sync", "/.revisions/_conflicts"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_space_rejects_sync_mutation_even_for_a_writer() {
+        let mut state = test_state();
+        state.boot_config.read_only = true;
+        let response = crate::build_router(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/.revisions/_sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

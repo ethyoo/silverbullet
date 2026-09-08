@@ -34,7 +34,8 @@ tower = { version = "0.5", features = ["util"] }
 notify = { workspace = true }
 tokio-stream = { workspace = true }
 
+tempfile = "3"
+
 [dev-dependencies]
 silverbullet-server-common = { path = "../server-common", features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
-tempfile = "3"

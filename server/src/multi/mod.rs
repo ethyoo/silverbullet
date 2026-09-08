@@ -6,6 +6,7 @@ pub mod access;
 pub mod admin_api;
 pub mod config;
 pub mod dispatch;
+pub mod git_connection;
 pub mod instance;
 pub mod manager;
 pub mod policy;

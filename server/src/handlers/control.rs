@@ -26,12 +26,16 @@ struct ConfigResponse<'a> {
     space_prefixes: Vec<String>,
 }
 
-pub async fn handle_config(
+pub(crate) async fn handle_config(
     State(state): State<Arc<ServerState>>,
     axum::Extension(actor): axum::Extension<crate::auth::Actor>,
+    revision_access: Option<axum::Extension<crate::router::RevisionAccess>>,
 ) -> impl IntoResponse {
     let writable = actor.level >= crate::auth::AccessLevel::Write;
     let mut boot_config = state.boot_config.clone();
+    if revision_access.is_some_and(|access| !access.0 .0) {
+        boot_config.revisions = silverbullet_server_common::RevisionsMode::Disabled;
+    }
     if !writable {
         boot_config.read_only = true;
         boot_config.shell_backend = "noop".into();
@@ -153,13 +157,38 @@ mod tests {
         assert_eq!(v["readOnly"], false);
     }
 
+    #[tokio::test]
+    async fn public_boot_hides_revisions_but_read_members_keep_git_views() {
+        for (is_member, expected) in [(false, "disabled"), (true, "managed")] {
+            let mut state = test_state();
+            state.boot_config.account_managed = true;
+            state.boot_config.revisions = silverbullet_server_common::RevisionsMode::Managed;
+            let actor = crate::auth::Actor {
+                level: crate::auth::AccessLevel::Read,
+                ..Default::default()
+            };
+            let response = super::handle_config(
+                axum::extract::State(Arc::new(state)),
+                axum::Extension(actor),
+                Some(axum::Extension(crate::router::RevisionAccess(is_member))),
+            )
+            .await
+            .into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["revisions"], expected);
+        }
+    }
+
     async fn config_for(level: crate::auth::AccessLevel) -> serde_json::Value {
         let state = Arc::new(test_state());
         let actor = crate::auth::Actor {
             level,
             ..Default::default()
         };
-        let resp = super::handle_config(axum::extract::State(state), axum::Extension(actor))
+        let resp = super::handle_config(axum::extract::State(state), axum::Extension(actor), None)
             .await
             .into_response();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -193,6 +222,7 @@ mod tests {
         let resp = super::handle_config(
             axum::extract::State(Arc::new(state)),
             axum::Extension(actor),
+            None,
         )
         .await
         .into_response();
