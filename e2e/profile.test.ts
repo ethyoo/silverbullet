@@ -66,9 +66,9 @@ async function login(
   await page.getByRole("button", { name: "Log in" }).click();
   // Login redirects client-side; without waiting for it to land, a
   // follow-up page.goto races the in-flight navigation and gets aborted.
-  // "Log out" is present on the post-login shell for both admins and
-  // members, unlike the "Spaces" tab/heading (admin vs. member differ).
-  await page.getByRole("button", { name: "Log out" }).waitFor();
+  await page
+    .getByRole("button", { name: "Profile menu", exact: true })
+    .waitFor();
 }
 
 /** Call an admin API endpoint using the given page's session cookie. */

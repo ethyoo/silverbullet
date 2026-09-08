@@ -58,6 +58,7 @@ export function ProfileView({
         });
       }}
     >
+      <h1>Profile</h1>
       {error && <Alert variant="error">{error}</Alert>}
       <p class="sb-help-text">
         Used for revision history and collaboration features.

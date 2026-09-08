@@ -1,5 +1,11 @@
 import type { RuntimeAvailability } from "./runtime_availability.ts";
-import type { FieldError, ProfileInfo, UserInfo } from "./types.ts";
+import type {
+  FieldError,
+  GitStatus,
+  GitDraft,
+  ProfileInfo,
+  UserInfo,
+} from "./types.ts";
 
 export async function api(
   method: string,
@@ -25,6 +31,11 @@ export async function api(
       },
     ];
     if (resp.status === 404) errors.notFound = true;
+    // A handful of routes (git sync) attach a structured `kind`/`message`
+    // alongside the generic `errors` array, for callers that want to run
+    // their own copy (e.g. `describeSyncError`) instead of the raw string.
+    if (typeof json.kind === "string") errors.kind = json.kind;
+    if (typeof json.message === "string") errors.detail = json.message;
     throw errors;
   }
   return json;
@@ -138,4 +149,82 @@ export function deleteToken(user: string, name: string): Promise<void> {
     "DELETE",
     `users/${encodeURIComponent(user)}/tokens/${encodeURIComponent(name)}`,
   );
+}
+
+// --- Git sync (per-space) --------------------------------------------------
+
+export function getGitStatus(spaceId: string): Promise<GitStatus> {
+  return adminApi("GET", `spaces/${encodeURIComponent(spaceId)}/git`);
+}
+
+export function createGitDraft(spaceId: string): Promise<GitDraft> {
+  return adminApi("POST", `spaces/${encodeURIComponent(spaceId)}/git/draft`);
+}
+
+export function updateGitDraft(
+  spaceId: string,
+  draft: GitDraft,
+): Promise<GitDraft> {
+  return adminApi(
+    "PUT",
+    `spaces/${encodeURIComponent(spaceId)}/git/draft/${encodeURIComponent(draft.id)}`,
+    {
+      version: draft.version,
+      url: draft.url,
+      mode: draft.mode,
+      pullIntervalSecs: draft.pullIntervalSecs,
+    },
+  );
+}
+
+export function discardGitDraft(
+  spaceId: string,
+  draftId: string,
+): Promise<void> {
+  return adminApi(
+    "DELETE",
+    `spaces/${encodeURIComponent(spaceId)}/git/draft/${encodeURIComponent(draftId)}`,
+  );
+}
+
+export function gitDraftAction(
+  spaceId: string,
+  draft: GitDraft,
+  action: "key" | "test",
+): Promise<GitDraft> {
+  return adminApi(
+    "POST",
+    `spaces/${encodeURIComponent(spaceId)}/git/draft/${encodeURIComponent(draft.id)}/${action}`,
+    { version: draft.version },
+  );
+}
+
+export function applyGitDraft(
+  spaceId: string,
+  draft: GitDraft,
+  allowUnrelated: boolean,
+): Promise<void> {
+  return adminApi(
+    "POST",
+    `spaces/${encodeURIComponent(spaceId)}/git/draft/${encodeURIComponent(draft.id)}/apply`,
+    { version: draft.version, allowUnrelated },
+  );
+}
+
+export function setGitPaused(spaceId: string, paused: boolean): Promise<void> {
+  return adminApi(
+    "POST",
+    `spaces/${encodeURIComponent(spaceId)}/git/${paused ? "pause" : "resume"}`,
+  );
+}
+
+export function disconnectGit(spaceId: string): Promise<void> {
+  return adminApi(
+    "DELETE",
+    `spaces/${encodeURIComponent(spaceId)}/git/connection`,
+  );
+}
+
+export function syncGitNow(spaceId: string): Promise<void> {
+  return adminApi("POST", `spaces/${encodeURIComponent(spaceId)}/git/sync`, {});
 }

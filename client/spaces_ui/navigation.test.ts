@@ -145,3 +145,11 @@ test("a download link is left to the browser", async () => {
     ),
   ).toBe(false);
 });
+
+test("navigation requires the active draft guard to allow departure", async () => {
+  const { setNavigationGuard, canNavigate } = await load(BASE, HERE);
+  const release = setNavigationGuard(() => false);
+  expect(canNavigate()).toBe(false);
+  release();
+  expect(canNavigate()).toBe(true);
+});

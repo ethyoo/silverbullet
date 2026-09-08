@@ -1,11 +1,32 @@
 import { createContext } from "preact";
-import { useCallback, useContext, useEffect, useState } from "preact/hooks";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "preact/hooks";
 import { parseSpacesRoute, SPACES_BASE, type SpacesRoute } from "./routes.ts";
 
 /** Navigate to another Space Manager screen without reloading the page. */
 export type Navigate = (url: string) => void;
 
 const NavigateContext = createContext<Navigate>(() => {});
+
+let navigationGuard: ((url?: string) => boolean) | undefined;
+
+export function setNavigationGuard(
+  guard: (url?: string) => boolean,
+): () => void {
+  navigationGuard = guard;
+  return () => {
+    if (navigationGuard === guard) navigationGuard = undefined;
+  };
+}
+
+export function canNavigate(url?: string): boolean {
+  return navigationGuard?.(url) ?? true;
+}
 
 /**
  * In-app navigation. Falls back to a no-op outside the provider, which only
@@ -56,16 +77,45 @@ export function shouldIntercept(
  */
 export function useSpacesRouter(): { route: SpacesRoute; navigate: Navigate } {
   const [route, setRoute] = useState<SpacesRoute>(parseSpacesRoute);
+  const current = useRef({
+    url: `${location.pathname}${location.search}`,
+    index: history.state?.spacesIndex ?? 0,
+  });
 
   useEffect(() => {
-    const onPopState = () => setRoute(parseSpacesRoute());
+    history.replaceState(
+      { ...history.state, spacesIndex: current.current.index },
+      "",
+    );
+    const onPopState = (event: PopStateEvent) => {
+      const index = event.state?.spacesIndex;
+      if (index === current.current.index) return;
+      if (!canNavigate(`${location.pathname}${location.search}`)) {
+        if (typeof index === "number")
+          history.go(current.current.index - index);
+        else
+          history.pushState(
+            { spacesIndex: current.current.index },
+            "",
+            current.current.url,
+          );
+        return;
+      }
+      current.current = {
+        url: `${location.pathname}${location.search}`,
+        index: index ?? 0,
+      };
+      setRoute(parseSpacesRoute());
+    };
     addEventListener("popstate", onPopState);
     return () => removeEventListener("popstate", onPopState);
   }, []);
 
   const navigate = useCallback<Navigate>((url) => {
     if (url === `${location.pathname}${location.search}`) return;
-    history.pushState(null, "", url);
+    if (!canNavigate(url)) return;
+    current.current = { url, index: current.current.index + 1 };
+    history.pushState({ spacesIndex: current.current.index }, "", url);
     setRoute(parseSpacesRoute());
     // A screen change is a fresh page as far as the reader is concerned; a
     // long list left the next screen scrolled into its middle.

@@ -225,6 +225,9 @@ body.sb-standalone.sb-page {
 }
 
 .sb-standalone .sb-wordmark {
+  color: inherit;
+  text-decoration: none;
+  font-weight: bold;
   display: inline-flex;
   align-items: center;
   gap: 0.4em;
@@ -434,12 +437,18 @@ body.sb-standalone.sb-page {
   font-family: monospace;
 }
 
-.sb-standalone .sb-access-table {
+.sb-standalone fieldset {
   border: 1px solid #ddd;
   border-radius: 0.4em;
   padding: 0.5rem 0.75rem;
   margin-top: 0.5rem;
+  // Defensive: the UA stylesheet's `min-inline-size: min-content` would stop a
+  // fieldset shrinking inside a flex container. It does not bite in today's
+  // layout, where a fieldset is a block child of a non-flex form.
+  min-width: 0;
+}
 
+.sb-standalone .sb-access-table {
   .sb-access-row {
     display: flex;
     align-items: center;
@@ -459,7 +468,7 @@ body.sb-standalone.sb-page {
   }
 }
 
-.sb-standalone .sb-access-table legend {
+.sb-standalone fieldset legend {
   font-weight: 600;
   padding: 0 0.3em;
 }
@@ -531,7 +540,7 @@ body.sb-standalone.sb-page {
   /* The header's three parts don't fit on one line. `display: contents` lifts
      the wordmark and tabs out of their wrapper so all three become siblings of
      the flex container, which lets the tab bar claim a full-width row of its
-     own below the wordmark and the log-out link. */
+     own below the wordmark and the profile menu. */
   .sb-standalone .sb-spaces-header {
     flex-wrap: wrap;
     row-gap: 0.25rem;
@@ -555,11 +564,6 @@ body.sb-standalone.sb-page {
     padding: 0 0.6rem;
   }
 
-  .sb-standalone .sb-logout {
-    display: inline-flex;
-    align-items: center;
-    min-height: 2.75rem;
-  }
 
   /* Column alignment across rows stops being worth anything once the columns
      are too narrow to hold their content: give the name a line of its own and
@@ -604,4 +608,116 @@ body.sb-standalone.sb-page {
     border-right: 0;
     border-bottom: 1px solid #0002;
   }
+}
+
+body.sb-standalone .sb-git-page {
+  h4 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 1.5rem 0 1rem;
+  }
+
+  code, h2, h4, dd {
+    overflow-wrap: anywhere;
+  }
+
+  label {
+    display: block;
+    margin-top: 1rem;
+  }
+
+  textarea {
+    width: 100%;
+    font-family: var(--editor-monospace-font, monospace);
+  }
+
+  dl {
+    display: grid;
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr);
+    gap: 0.6rem 1rem;
+  }
+
+  dd {
+    margin: 0;
+  }
+
+  .row {
+    flex-wrap: wrap;
+  }
+
+  .sb-git-check {
+    margin-bottom: 1.5rem;
+  }
+}
+
+body.sb-standalone.sb-page:has(.sb-spaces-header) {
+  max-width: 1040px;
+}
+
+body.sb-standalone .sb-space-settings {
+  .sb-settings-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-block: 1.5rem 2rem;
+    h1 { margin: 0.25rem 0 0; overflow-wrap: anywhere; }
+    p { margin: 0; color: var(--subtle-color); font-size: 0.9rem; }
+    .sb-button { flex-shrink: 0; }
+  }
+  .sb-settings-layout {
+    display: grid;
+    grid-template-columns: 170px minmax(0, 1fr);
+    gap: 2rem;
+    align-items: start;
+  }
+  .sb-settings-sidebar {
+    position: sticky;
+    top: 1rem;
+    display: grid;
+    gap: 0.25rem;
+    a {
+      display: flex;
+      align-items: center;
+      padding: 0.7rem 0.85rem;
+      border-radius: 6px;
+      color: inherit;
+      text-decoration: none;
+      &[aria-current="page"] { background: var(--ui-accent-color); color: var(--ui-accent-contrast-color); }
+      &:hover:not([aria-current]) { background: color-mix(in srgb, var(--ui-accent-color) 8%, transparent); }
+      &[data-dirty]::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-left: auto; }
+    }
+  }
+  .sb-input, .sb-select { min-height: 36px; }
+  .sb-settings-mobile { display: none; }
+  .sb-settings-content { min-width: 0; h2:first-child { margin-top: 0; } }
+  .sb-git-page { border-top: 1px solid var(--modal-border-color); padding-top: 0.5rem; }
+}
+body.sb-standalone .sb-settings-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+
+@media (max-width: 640px) {
+  body.sb-standalone .sb-space-settings {
+    .sb-settings-layout { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
+    .sb-input, .sb-select { min-height: 44px; }
+    .sb-settings-sidebar { display: none; }
+    .sb-settings-mobile { display: grid; gap: 0.5rem; }
+    .sb-settings-heading { align-items: start; flex-wrap: wrap; }
+    .sb-settings-content .row { flex-wrap: wrap; }
+    .sb-git-page dl { grid-template-columns: minmax(0, 1fr); }
+  }
+}
+
+.sb-standalone .sb-spaces-profile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  &:hover { background: var(--subtle-background-color); }
 }

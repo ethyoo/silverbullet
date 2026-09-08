@@ -83,13 +83,14 @@ test("first run: login, create a space, open it, edit a page", async ({
   await page.getByLabel("Prefix").fill("/play");
   await expect(page.locator("#space-folder")).toHaveValue("spaces/playground");
   await expect(page.getByRole("button", { name: "Browse…" })).toBeVisible();
-  await page.locator(".sb-access-public select").selectOption("write");
   await page.getByRole("button", { name: "Create" }).click();
 
-  // Creation lands on the stable detail route. Return to the list to inspect
-  // its runtime status and open the space.
   await expect(page).toHaveURL(/\/\.spaces\/[^/]+$/);
-  await page.getByRole("link", { name: "Spaces" }).click();
+  await page.getByRole("link", { name: "Access", exact: true }).click();
+  await page.locator(".sb-access-public select").selectOption("write");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await page.getByRole("link", { name: "Spaces", exact: true }).click();
 
   // It shows as running.
   await expect(page.getByText("Playground")).toBeVisible();

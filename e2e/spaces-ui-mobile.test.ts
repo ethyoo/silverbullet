@@ -103,25 +103,23 @@ test("the Space Manager fits a phone viewport on every screen", async ({
 
   for (const path of ["/new", "/users", `/users/${ADMIN_USER}`, "/profile"]) {
     await page.goto(`${base}/.spaces${path}`);
-    // Each screen fetches before it renders its controls; the log-out button
-    // is in the shell, so wait on something the screen itself owns.
-    await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Profile menu", exact: true }),
+    ).toBeVisible();
     await page.waitForLoadState("networkidle");
     await expectFits(page);
   }
 });
 
-test("the tab bar reads as one row and the log-out link as one line", async ({
-  page,
-}) => {
+test("the tabs and profile menu fit the mobile header", async ({ page }) => {
   await page.goto(`${base}/.spaces/login`);
   await page.getByLabel("Username").fill(ADMIN_USER);
   await page.getByLabel("Password", { exact: true }).fill(ADMIN_PASSWORD);
   await page.getByRole("button", { name: "Log in" }).click();
-  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Profile menu", exact: true }),
+  ).toBeVisible();
 
-  // The header used to overflow its card, which stacked the three tabs on top
-  // of one another and broke "Log out" across two lines.
   const header = await page.evaluate(() => {
     // A Range's client rects follow the text's own line boxes, so this counts
     // rendered lines whatever the element's display happens to be. Distinct
@@ -135,7 +133,6 @@ test("the tab bar reads as one row and the log-out link as one line", async ({
     };
     const tabs = [...document.querySelectorAll(".sb-tab")];
     return {
-      logoutLines: linesOf(document.querySelector(".sb-logout")!),
       tabLines: tabs.map(linesOf),
       tabTops: [
         ...new Set(tabs.map((t) => Math.round(t.getBoundingClientRect().top))),
@@ -143,10 +140,17 @@ test("the tab bar reads as one row and the log-out link as one line", async ({
     };
   });
 
-  expect(header.logoutLines).toBe(1);
-  expect(header.tabLines).toEqual([1, 1, 1]);
-  // One distinct top edge: all three tabs sit on the same row.
+  expect(header.tabLines).toEqual([1, 1]);
   expect(header.tabTops).toHaveLength(1);
+  await page.getByRole("button", { name: "Profile menu", exact: true }).click();
+  await expect(page.locator(".sb-anchored-menu")).toBeVisible();
+  await expectFits(page);
+  const menuBounds = await page.locator(".sb-anchored-menu").boundingBox();
+  expect(menuBounds!.x).toBeGreaterThanOrEqual(0);
+  expect(menuBounds!.x + menuBounds!.width).toBeLessThanOrEqual(375);
+  for (const button of await page.locator(".sb-anchored-menu button").all()) {
+    expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  }
 });
 
 test("form fields are big enough to tap and never trigger iOS zoom", async ({

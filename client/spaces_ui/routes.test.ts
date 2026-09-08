@@ -189,3 +189,20 @@ test("loginUrl's default argument is still passed through the safety check", asy
   const { loginUrl } = await load("/somewhere-else", "");
   expect(loginUrl()).toBe("/.spaces/login");
 });
+
+test("Git connection has a dedicated space route", async () => {
+  expect((await load("/.spaces/notes%20team/git")).parseSpacesRoute()).toEqual({
+    screen: "space-git",
+    id: "notes team",
+  });
+});
+
+test("space sections have refreshable query routes", async () => {
+  expect(
+    (await load("/.spaces/notebook", "?section=revisions")).parseSpacesRoute(),
+  ).toEqual({
+    screen: "space",
+    id: "notebook",
+    section: "revisions",
+  });
+});

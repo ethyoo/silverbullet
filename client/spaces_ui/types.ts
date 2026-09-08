@@ -1,3 +1,4 @@
+import type { GitSyncSnapshot } from "@silverbulletmd/silverbullet/type/revisions";
 export type RevisionsMode = "managed" | "unmanaged" | "disabled";
 
 export type SpaceAccess = "none" | "read" | "write";
@@ -9,6 +10,64 @@ export type Binding =
 
 export type FieldError = {
   field: string;
+  message: string;
+};
+
+/** `off` syncs nothing; `key` uses a deploy key SilverBullet generates and
+ * stores; `manual` uses whatever git credentials the server already has. */
+export type GitSyncMode = "off" | "key" | "manual";
+
+export type GitSyncConfig = {
+  mode: GitSyncMode;
+  pullIntervalSecs: number;
+  paused?: boolean;
+};
+
+export type CommitTiming = { quietSecs: number; maxIntervalSecs: number };
+
+/** `SyncState` on the server (`revisions::engine`) serializes with
+ * `#[serde(tag = "state", rename_all = "camelCase")]`, which renames variant
+ * names but not their fields — so `Paused`'s field stays `reason`, not
+ * `message`. */
+export type GitStatus = {
+  remoteUrl: string | null;
+  remoteName: string | null;
+  branch: string | null;
+  // The mode configured in `spaces.json`, not one derived from whether a key
+  // file exists — the two can disagree, and the configured mode wins.
+  credentialMode: GitSyncMode;
+  publicKey: string | null;
+  fingerprint: string | null;
+  // `null` means genuinely unknown (no `FETCH_HEAD`/tracking ref yet), not
+  // zero — the first-sync confirmation must not block on it.
+  ahead: number | null;
+  behind: number | null;
+  sync: GitSyncSnapshot["sync"];
+  lastAttempt?: number | null;
+  lastSuccess?: number | null;
+  version?: number;
+  enabled?: boolean;
+  paused?: boolean;
+  pullIntervalSecs?: number;
+  dirty?: boolean;
+};
+
+/** `POST spaces/{id}/git/test`. See `classify_git_test_error` on the server
+ * for the exact classification these come from. */
+export type GitTestKind =
+  | "ok"
+  | "emptyRepo"
+  | "behind"
+  | "authFailed"
+  | "sshRequired"
+  | "notFound"
+  | "unreachable"
+  | "other";
+
+export type GitTestResult = {
+  reachable: boolean;
+  writable: boolean;
+  kind: GitTestKind;
   message: string;
 };
 
@@ -25,6 +84,8 @@ export type SpaceInfo = {
   shell: { enabled: boolean; whitelist: string[] };
   runtimeApi: boolean;
   revisions?: RevisionsMode;
+  gitSync?: GitSyncConfig;
+  revisionsCommit?: CommitTiming;
   indexPage: string;
   status: { state: "running" | "errored"; reason?: string };
 };
@@ -63,3 +124,27 @@ export type AuthState =
   | { phase: "login" }
   | { phase: "authed"; username: string; admin: boolean }
   | { phase: "error"; message: string };
+
+export type GitDraft = {
+  branch?: string | null;
+  remoteBranch?: string | null;
+  remoteName?: string | null;
+  id: string;
+  version: number;
+  url: string;
+  mode: "key" | "manual";
+  pullIntervalSecs: number;
+  publicKey: string | null;
+  fingerprint: string | null;
+  test?: GitTestResult & {
+    checkedUrl: string;
+    checkedAt: number;
+    branch?: string | null;
+    remoteBranch?: string | null;
+    localHead?: string | null;
+    remoteHead?: string | null;
+    ahead?: number | null;
+    behind?: number | null;
+    unrelated: boolean;
+  };
+};

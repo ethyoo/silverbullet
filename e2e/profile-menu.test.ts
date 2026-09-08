@@ -261,9 +261,9 @@ test("Edit profile and All spaces are reachable, and selecting an item closes th
     page.getByRole("button", { name: "Edit profile" }).click(),
   ]);
   await expect(profileTab).toHaveURL(`${base}/.spaces/profile`);
-  await expect(profileTab.locator(".sb-tab.sb-active")).toHaveText(
-    "bo's Profile",
-  );
+  await expect(
+    profileTab.getByRole("heading", { name: "Profile", exact: true }),
+  ).toBeVisible();
   await expect(page).toHaveURL(`${base}/bo/Welcome`);
   await profileTab.close();
 
@@ -541,4 +541,28 @@ singleSpaceTest.describe("single-space server", () => {
       expect(asked).toEqual([]);
     },
   );
+});
+
+test("keyboard interaction with the profile dropdown does not edit the note", async ({
+  page,
+}) => {
+  await gotoAsAda(page, "/keyboard-menu");
+  const before = await page.locator(".cm-content").innerText();
+  await profileTrigger(page).click();
+  await expect(
+    page.getByRole("button", { name: "Edit profile", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(
+    page.getByRole("button", { name: "All spaces", exact: true }),
+  ).toBeFocused();
+  expect(await page.locator(".cm-content").innerText()).toBe(before);
+  await page.keyboard.press("Shift+Tab");
+  const [profileTab] = await Promise.all([
+    page.waitForEvent("popup"),
+    page.keyboard.press("Enter"),
+  ]);
+  await expect(profileTab).toHaveURL(`${base}/.spaces/profile`);
+  expect(await page.locator(".cm-content").innerText()).toBe(before);
+  await profileTab.close();
 });

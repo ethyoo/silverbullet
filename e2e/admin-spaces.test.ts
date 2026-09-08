@@ -118,10 +118,9 @@ test("editing a space preserves fields the form does not manage", async ({
   await page.getByRole("link", { name: "Edit" }).click();
   await expect(page).toHaveURL(`${base}/.spaces/${encodeURIComponent(id)}`);
   await page.getByLabel("Name").fill("Renamed");
-  await page.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
 
-  // Saving returns to the space list.
-  await expect(page).toHaveURL(`${base}/.spaces/`);
+  await expect(page.getByRole("status")).toHaveText("Saved");
   // The canonical edit URL still resolves directly, with the saved value.
   await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
   await expect(page.getByLabel("Name")).toHaveValue("Renamed");
@@ -133,24 +132,20 @@ test("editing a space preserves fields the form does not manage", async ({
   expect(after.revisions).toBe("managed");
 });
 
-test("saving an existing space returns to the list showing the change", async ({
+test("saving an existing space stays on its settings with confirmation", async ({
   page,
 }) => {
   const id = await createSpaceViaApi(page, {
     name: "Feedback",
     binding: { prefix: "/feedback" },
   });
-
   await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
   await page.getByLabel("Name").fill("Feedback Renamed");
-  await page.getByRole("button", { name: "Save" }).click();
-
-  // Landing back on the list is the confirmation: the admin sees the space
-  // they just edited carrying its new name, rather than an unchanged-looking
-  // form they have to take on trust.
-  await expect(page).toHaveURL(`${base}/.spaces/`);
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page).toHaveURL(`${base}/.spaces/${encodeURIComponent(id)}`);
+  await expect(page.getByRole("status")).toHaveText("Saved");
   await expect(
-    page.getByRole("link", { name: "Feedback Renamed" }),
+    page.getByRole("heading", { name: "Feedback Renamed" }),
   ).toBeVisible();
 });
 
@@ -163,7 +158,7 @@ test("the shell allow list is editable, and only shown when shell is enabled", a
     shell: { enabled: true, whitelist: ["git"] },
   });
 
-  await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
+  await page.goto(`${base}/.spaces/${encodeURIComponent(id)}?section=advanced`);
 
   const allowed = page.getByLabel("Allowed commands");
   await expect(allowed).toHaveValue("git");
@@ -176,8 +171,8 @@ test("the shell allow list is editable, and only shown when shell is enabled", a
   await expect(allowed).toHaveValue("git");
 
   await allowed.fill("git pandoc");
-  await page.getByRole("button", { name: "Save" }).click();
-  await expect(page).toHaveURL(`${base}/.spaces/`);
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
 
   const after = await fetchSpaceViaApi(page, id);
   expect(after.shell).toEqual({ enabled: true, whitelist: ["git", "pandoc"] });
@@ -202,7 +197,7 @@ test("switching a host-bound space to prefix without a value is rejected", async
   await expect(page.locator(".sb-url-affix")).toHaveText(["https://"]);
 
   await page.getByLabel("Binding").selectOption("prefix");
-  await page.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
 
   await expect(page.locator(".sb-alert-error")).toContainText(
     "prefix is required",
@@ -288,11 +283,9 @@ test("a non-admin sees only their spaces and no admin affordances", async ({
 
   await expect(page.locator(".sb-space-list li")).toHaveCount(1);
   await expect(page.locator("text=Members Only")).toBeVisible();
-  // Every account reaches its own Profile tab; Spaces and Users stay
-  // admin-only entries within the same tab bar.
   const tabs = page.locator(".sb-tabs");
   await expect(
-    tabs.getByRole("link", { name: "member's Profile" }),
+    page.getByRole("button", { name: "Profile menu", exact: true }),
   ).toBeVisible();
   await expect(tabs.getByRole("link", { name: "Spaces" })).toHaveCount(0);
   await expect(tabs.getByRole("link", { name: "Users" })).toHaveCount(0);
@@ -308,4 +301,204 @@ test("a non-admin sees only their spaces and no admin affordances", async ({
   // authenticated (just not an admin), so this is 403, not 401.
   const resp = await page.request.get(`${base}/.spaces/api/admin/users`);
   expect(resp.status()).toBe(403);
+});
+
+test("leaving settings warns about drafts but switching sections preserves them", async ({
+  page,
+}) => {
+  const id = await createSpaceViaApi(page, {
+    name: "Notebook",
+    binding: { prefix: "/notebook" },
+    revisions: "managed",
+  });
+  await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
+  await page.getByLabel("Name", { exact: true }).fill("Edited notebook");
+  await page
+    .getByRole("navigation", { name: "Space settings" })
+    .getByRole("link", { name: "Revisions" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Git sync", exact: true }),
+  ).toBeVisible();
+  let warned = false;
+  page.once("dialog", async (dialog) => {
+    warned = true;
+    expect(dialog.message()).toContain("unsaved space settings");
+    await dialog.dismiss();
+  });
+  await page.getByRole("link", { name: "← All spaces", exact: true }).click();
+  expect(warned).toBe(true);
+  await page
+    .getByRole("navigation", { name: "Space settings" })
+    .getByRole("link", { name: "General" })
+    .click();
+  await expect(page.getByLabel("Name", { exact: true })).toHaveValue(
+    "Edited notebook",
+  );
+});
+
+test("settings sections preserve drafts and save only the visible group", async ({
+  page,
+}) => {
+  const id = await createSpaceViaApi(page, {
+    name: "Section notebook",
+    binding: { prefix: "/section-notebook" },
+    shell: { enabled: false, whitelist: ["git"] },
+  });
+  await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
+  const navigation = page.getByRole("navigation", { name: "Space settings" });
+  await expect(navigation.getByRole("link")).toHaveText([
+    "General",
+    "Access",
+    "Revisions",
+    "Advanced",
+  ]);
+  await page.getByLabel("Name", { exact: true }).fill("Draft notebook");
+  await navigation.getByRole("link", { name: "Advanced" }).click();
+  await expect(page.getByLabel("Name", { exact: true })).toBeHidden();
+  await page.getByLabel("Enable shell commands").check();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Saved" }),
+  ).toBeVisible();
+  const after = await fetchSpaceViaApi(page, id);
+  expect(after.name).toBe("Section notebook");
+  expect(after.shell).toEqual({ enabled: true, whitelist: ["git"] });
+  await navigation.getByRole("link", { name: "General" }).click();
+  await expect(page.getByLabel("Name", { exact: true })).toHaveValue(
+    "Draft notebook",
+  );
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await page.goBack();
+  await expect(
+    page.getByRole("heading", { name: "Advanced", exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Advanced", exact: true }),
+  ).toBeVisible();
+});
+
+test("mobile settings use a section selector without horizontal overflow", async ({
+  page,
+}) => {
+  const id = await createSpaceViaApi(page, {
+    name: "Pocket notebook",
+    binding: { prefix: "/pocket-notebook" },
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${base}/.spaces/${encodeURIComponent(id)}`);
+  await page.getByLabel("Settings section").selectOption("access");
+  await expect(
+    page.getByRole("heading", { name: "Access", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "Space settings" }),
+  ).toBeHidden();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
+test("canceling logout keeps the session and unsaved settings", async ({
+  page,
+}) => {
+  const id = await createSpaceViaApi(page, {
+    name: "Draft notebook",
+    folder: "spaces/draft-notebook",
+    binding: { prefix: "/draft-notebook" },
+  });
+  await page.goto(`${base}/.spaces/${id}`);
+  await page.getByLabel("Name", { exact: true }).fill("Saved notebook");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "Profile menu", exact: true }).click();
+  await page.getByRole("button", { name: "Log out", exact: true }).click();
+  expect((await page.request.get(`${base}/.spaces/api/session`)).ok()).toBe(
+    true,
+  );
+  await expect(page.getByLabel("Name", { exact: true })).toHaveValue(
+    "Saved notebook",
+  );
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status", { exact: true })).toHaveText("Saved");
+  await page.getByLabel("Name", { exact: true }).fill("Another draft");
+  let confirmations = 0;
+  page.on("dialog", async (dialog) => {
+    confirmations++;
+    await dialog.accept();
+  });
+  await page.getByRole("button", { name: "Profile menu", exact: true }).click();
+  await page.getByRole("button", { name: "Log out", exact: true }).click();
+  await expect(page).toHaveURL(`${base}/.spaces/login`);
+  await expect(page.getByLabel("Username")).toBeVisible();
+  expect(confirmations).toBe(1);
+});
+
+test("finish or cancel Git setup before changing revision mode", async ({
+  page,
+}) => {
+  const id = await createSpaceViaApi(page, {
+    name: "Revision notebook",
+    folder: "spaces/revision-notebook",
+    binding: { prefix: "/revision-notebook" },
+    revisions: "managed",
+  });
+  await page.goto(`${base}/.spaces/${id}?section=revisions`);
+  await page
+    .getByRole("button", { name: "Connect repository", exact: true })
+    .click();
+  await expect(page.getByLabel("Mode", { exact: true })).toBeDisabled();
+  await expect(
+    page.getByText(
+      "Finish or cancel Git setup below before changing revision mode.",
+    ),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByLabel("Mode", { exact: true })).toBeEnabled();
+  await page.getByLabel("Mode", { exact: true }).selectOption("disabled");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status", { exact: true })).toHaveText("Saved");
+  await page.getByRole("link", { name: "← All spaces", exact: true }).click();
+  await expect(page).toHaveURL(`${base}/.spaces/`);
+});
+
+test("the shared profile menu replaces account navigation in the header", async ({
+  page,
+}) => {
+  await expect(page.getByRole("link", { name: "admin's Profile" })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("button", { name: "Log out", exact: true }),
+  ).toHaveCount(0);
+  const trigger = page.getByRole("button", {
+    name: "Profile menu",
+    exact: true,
+  });
+  await trigger.click();
+  const menu = page.locator(".sb-anchored-menu");
+  await expect(menu.getByRole("button")).toHaveText([
+    "Edit profile",
+    "All spaces",
+    "Log out",
+  ]);
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await menu.getByRole("button", { name: "Edit profile", exact: true }).click();
+  await expect(page).toHaveURL(`${base}/.spaces/profile`);
+  await page.getByLabel("Full name").fill("Taylor Example");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("Saved.", { exact: true })).toBeVisible();
+  await trigger.click();
+  await expect(menu.locator(".sb-anchored-menu-title")).toHaveText(
+    "Taylor Example",
+  );
+  await expect(trigger).toHaveText("TE");
+  await menu.getByRole("button", { name: "All spaces", exact: true }).click();
+  await expect(page).toHaveURL(`${base}/.spaces/`);
 });

@@ -4,6 +4,7 @@ import { Alert } from "@silverbulletmd/silverbullet/ui";
 import { api, formatApiError, getSession } from "../api.ts";
 import {
   NavigateProvider,
+  canNavigate,
   shouldIntercept,
   useSpacesRouter,
 } from "../navigation.ts";
@@ -14,6 +15,7 @@ import { Login } from "./Login.tsx";
 import { ProfileView } from "./ProfileView.tsx";
 import { SpaceEditor } from "./SpaceEditor.tsx";
 import { SpaceList } from "./SpaceList.tsx";
+import { SpaceProfileMenu } from "./SpaceProfileMenu.tsx";
 import { NewUser, UserDetail, UserList } from "./UsersView.tsx";
 
 type ScreenProps = {
@@ -33,12 +35,24 @@ const SpaceListScreen = ({ auth, onUnauthorized }: ScreenProps) => (
 const SpaceNewScreen = ({ onUnauthorized }: ScreenProps) => (
   <SpaceEditor onUnauthorized={onUnauthorized} />
 );
-const SpaceEditScreen = ({ route, onUnauthorized }: ScreenProps) => (
-  <SpaceEditor
-    id={(route as Extract<SpacesRoute, { screen: "space" }>).id}
-    onUnauthorized={onUnauthorized}
-  />
-);
+const SpaceEditScreen = ({ route, onUnauthorized }: ScreenProps) => {
+  const settings = route as Extract<
+    SpacesRoute,
+    { screen: "space" | "space-git" }
+  >;
+  return (
+    <SpaceEditor
+      key={settings.id}
+      id={settings.id}
+      section={
+        settings.screen === "space-git"
+          ? "revisions"
+          : (settings.section ?? "general")
+      }
+      onUnauthorized={onUnauthorized}
+    />
+  );
+};
 const UserListScreen = ({ auth, onUnauthorized }: ScreenProps) => (
   <UserList currentUsername={auth.username} onUnauthorized={onUnauthorized} />
 );
@@ -66,6 +80,7 @@ const SCREENS: Record<SpacesRoute["screen"], Screen | undefined> = {
   spaces: { view: SpaceListScreen, admin: false },
   "space-new": { view: SpaceNewScreen, admin: true },
   space: { view: SpaceEditScreen, admin: true },
+  "space-git": { view: SpaceEditScreen, admin: true },
   users: { view: UserListScreen, admin: true },
   "user-new": { view: UserNewScreen, admin: true },
   user: { view: UserDetailScreen, admin: true },
@@ -134,12 +149,11 @@ export function App() {
   const onUnauthorized = () => location.replace(loginUrl());
   const onSpacesTab = route.screen.startsWith("space");
   const onUsersTab = route.screen.startsWith("user");
-  const onProfileTab = route.screen === "profile";
   return (
     <NavigateProvider value={navigate}>
       <div class="sb-spaces-header">
         <div class="sb-spaces-header-left">
-          <strong class="sb-wordmark">
+          <a class="sb-wordmark" href={spacesUrl("/")}>
             {/* The dock icon, in the small copy meant for inline use (see
                 client/images/README.md). `alt` is empty on purpose: the
                 wordmark beside it already says "SilverBullet", so a
@@ -147,7 +161,7 @@ export function App() {
                 name twice. */}
             <img src="assets/logo-dock-96x96.png" alt="" />
             SilverBullet
-          </strong>
+          </a>
           {/* The active tab is what names the current screen — the list screens
               dropped their headings rather than repeat it — so it carries
               `aria-current` and not just a highlight class. */}
@@ -170,29 +184,25 @@ export function App() {
                 </a>
               </>
             )}
-            <a
-              class={`sb-tab ${onProfileTab ? "sb-active" : ""}`}
-              aria-current={onProfileTab ? "page" : undefined}
-              href={spacesUrl("/profile")}
-            >
-              {auth.username}'s Profile
-            </a>
           </nav>
         </div>
-        <button
-          type="button"
-          class="sb-link-button sb-logout"
-          onClick={async () => {
+        <SpaceProfileMenu
+          username={auth.username}
+          admin={auth.admin}
+          routeKey={`${location.pathname}${location.search}`}
+          onUnauthorized={onUnauthorized}
+          onLogout={async () => {
+            if (!canNavigate(spacesUrl("/login"))) return;
+            setAuth({ phase: "loading" });
             try {
               await api("GET", "api/logout");
               location.assign(spacesUrl("/login"));
             } catch (error: any) {
               if (error.unauthorized) onUnauthorized();
+              else setAuth(auth);
             }
           }}
-        >
-          Log out
-        </button>
+        />
       </div>
       {(() => {
         const screen = SCREENS[route.screen];

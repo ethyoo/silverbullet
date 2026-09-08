@@ -11,13 +11,14 @@ import {
 } from "@silverbulletmd/silverbullet/ui";
 import { adminApi, getServerInfo, listUsers } from "../api.ts";
 import { FolderPicker } from "../FolderPicker.tsx";
+import { formatDuration } from "../git_sync_copy.ts";
 import {
   type RuntimeAvailability,
   runtimeApiUnavailableReason,
 } from "../runtime_availability.ts";
 import { FieldErrors, useSlugDefaults } from "../space_fields.tsx";
 import type {
-  Binding,
+  CommitTiming,
   FieldError,
   MemberRole,
   RevisionsMode,
@@ -25,6 +26,29 @@ import type {
   SpaceInfo,
   UserInfo,
 } from "../types.ts";
+import {
+  SPACE_SECTIONS,
+  settingsPayload,
+  type SpaceSection,
+} from "../space_settings.ts";
+
+const COMMIT_PRESETS = [
+  {
+    label: "Responsive — about 30 seconds",
+    quietSecs: 30,
+    maxIntervalSecs: 300,
+  },
+  {
+    label: "Balanced — about 2 minutes",
+    quietSecs: 120,
+    maxIntervalSecs: 900,
+  },
+  {
+    label: "Relaxed — about 5 minutes",
+    quietSecs: 300,
+    maxIntervalSecs: 3600,
+  },
+];
 
 export function SpaceForm({
   id,
@@ -33,10 +57,16 @@ export function SpaceForm({
   cancelHref,
   onDeleted,
   onUnauthorized,
+  section = "general",
+  onDirtyChange,
+  connectionDraft = false,
 }: {
   id?: string;
   initial?: SpaceInfo;
-  onSaved: (id: string) => void;
+  onSaved: (id: string, patch?: Partial<SpaceInfo>) => void;
+  section?: SpaceSection;
+  connectionDraft?: boolean;
+  onDirtyChange?: (sections: SpaceSection[]) => void;
   cancelHref: string;
   onDeleted: () => void;
   onUnauthorized: () => void;
@@ -91,14 +121,13 @@ export function SpaceForm({
   const [revisions, setRevisions] = useState<RevisionsMode>(
     initial?.revisions ?? "disabled",
   );
+  const [revisionsCommit, setRevisionsCommit] = useState<CommitTiming>(
+    initial?.revisionsCommit ?? { quietSecs: 30, maxIntervalSecs: 300 },
+  );
   const [runtimeAvailability, setRuntimeAvailability] =
     useState<RuntimeAvailability | null>(null);
   const [indexPage, setIndexPage] = useState(initial?.indexPage ?? "index");
   const [errors, setErrors] = useState<FieldError[]>([]);
-  // Only ever "saving": a successful save navigates away — to the space list
-  // when editing, to the new space's own screen when creating — so leaving
-  // this screen *is* the confirmation, and there is no "saved" state left for
-  // this form to render.
   const [saveState, setSaveState] = useState<"idle" | "saving">("idle");
   const [hostStatus, setHostStatus] = useState<
     "verified" | "mismatch" | "unreachable" | null
@@ -167,324 +196,431 @@ export function SpaceForm({
   const runtimeApiUnavailable =
     runtimeApiUnavailableReason(runtimeAvailability);
 
+  const values: Partial<SpaceInfo> = {
+    name,
+    folder,
+    binding: bindType === "host" ? { host: hostValue } : { prefix },
+    access,
+    members: Object.fromEntries(
+      Object.entries(members).map(([username, role]) => [username, { role }]),
+    ),
+    readOnly,
+    shell: {
+      enabled: shellEnabled,
+      whitelist: shellWhitelist.split(/\s+/).filter(Boolean),
+    },
+    runtimeApi,
+    revisions,
+    revisionsCommit,
+    indexPage,
+  };
+  const [savedValues, setSavedValues] = useState<Partial<SpaceInfo>>(() => ({
+    ...values,
+    folder: initial?.folder ?? folder,
+    binding: initial?.binding ?? values.binding,
+  }));
+  const dirtySections = (Object.keys(SPACE_SECTIONS) as SpaceSection[]).filter(
+    (key) =>
+      JSON.stringify(settingsPayload(values, key)) !==
+      JSON.stringify(settingsPayload(savedValues, key)),
+  );
+  const dirtyKey = dirtySections.join(",");
+  useEffect(() => {
+    if (id) onDirtyChange?.(dirtySections);
+  }, [id, dirtyKey, onDirtyChange]);
+  const [savedSection, setSavedSection] = useState<SpaceSection>();
+  const [errorSection, setErrorSection] = useState<SpaceSection>();
+  const activeDirty = dirtySections.includes(section);
+  const modeBlocked =
+    section === "revisions" &&
+    connectionDraft &&
+    revisions !== initial?.revisions;
+  const visible = (value: SpaceSection) =>
+    id ? section === value : value === "general";
+
   return (
     <form
-      onSubmit={async (e) => {
-        e.preventDefault();
-        if (bindType === "prefix" && !prefix.trim()) {
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (saveState === "saving" || modeBlocked) return;
+        setErrorSection(section);
+        setSavedSection(undefined);
+        if (
+          (!id || section === "general") &&
+          bindType === "prefix" &&
+          !prefix.trim()
+        ) {
           setErrors([{ field: "binding", message: "prefix is required" }]);
           return;
         }
-        const binding: Binding =
-          bindType === "host" ? { host: hostValue } : { prefix };
-        const payload = {
-          name,
-          folder,
-          binding,
-          access,
-          members: Object.fromEntries(
-            Object.entries(members).map(([name, role]) => [name, { role }]),
-          ),
-          readOnly,
-          shell: {
-            enabled: shellEnabled,
-            // Sent even while the field is hidden, so turning shell commands
-            // off and back on does not silently discard the allow list.
-            whitelist: shellWhitelist.split(/\s+/).filter(Boolean),
-          },
-          runtimeApi,
-          revisions,
-          indexPage,
-        };
+        const payload = id ? settingsPayload(values, section) : values;
         setErrors([]);
         setSaveState("saving");
         try {
-          // PATCH, not PUT: this payload omits description, themeColor,
-          // headHtml, spaceIgnore and logPush, which the form has no inputs
-          // for. A full-replace PUT resets them on every save.
           if (id) {
-            await adminApi("PATCH", `spaces/${id}`, payload);
-            setSaveState("idle");
-            onSaved(id);
+            await adminApi(
+              "PATCH",
+              `spaces/${encodeURIComponent(id)}`,
+              payload,
+            );
+            setSavedValues((previous) => ({ ...previous, ...payload }));
+            setSavedSection(section);
+            onSaved(id, payload);
           } else {
             const result = await adminApi("POST", "spaces", payload);
-            setSaveState("idle");
             onSaved(result.id);
           }
-        } catch (errs) {
+        } catch (cause) {
+          if ((cause as any)?.unauthorized) onUnauthorized();
+          else
+            setErrors(
+              Array.isArray(cause)
+                ? cause
+                : [{ field: "", message: "Request failed" }],
+            );
+        } finally {
           setSaveState("idle");
-          if ((errs as any)?.unauthorized) {
-            onUnauthorized();
-            return;
-          }
-          setErrors(
-            Array.isArray(errs)
-              ? errs
-              : [{ field: "", message: "Request failed" }],
-          );
         }
       }}
     >
-      <h1>{id ? "Edit space" : "Create space"}</h1>
-      <FieldErrors errors={errors} />
-      <label for="space-name">Name</label>
-      <Input
-        id="space-name"
-        value={name}
-        onInput={(e) => {
-          const newName = e.currentTarget.value;
-          setName(newName);
-          onNameChange(newName);
-        }}
-      />
-      <label for="space-bind-type">Binding</label>
-      <Select
-        id="space-bind-type"
-        value={bindType}
-        onChange={(e) =>
-          setBindType(e.currentTarget.value as "prefix" | "host")
-        }
-      >
-        <option value="prefix">URL prefix (this host)</option>
-        <option value="host">Hostname</option>
-      </Select>
-      <label for="space-bind-value">
-        {bindType === "prefix" ? "Prefix" : "Hostname"}
-      </label>
-      {bindType === "prefix" ? (
-        <UrlPrefixInput
-          id="space-bind-value"
-          origin={location.origin}
-          value={prefix}
-          onInput={setPrefix}
-        />
-      ) : (
-        <div class="sb-url-input">
-          {/* Only the scheme is fixed, and it is always https://: SilverBullet
+      {id ? <h2>{SPACE_SECTIONS[section]}</h2> : <h1>Create space</h1>}
+      {(!id || errorSection === section) && <FieldErrors errors={errors} />}
+      <fieldset class="sb-settings-fields" disabled={saveState === "saving"}>
+        <div hidden={!visible("general")}>
+          <label for="space-name">Name</label>
+          <Input
+            id="space-name"
+            value={name}
+            onInput={(e) => {
+              const newName = e.currentTarget.value;
+              setName(newName);
+              onNameChange(newName);
+            }}
+          />
+          <label for="space-bind-type">Binding</label>
+          <Select
+            id="space-bind-type"
+            value={bindType}
+            onChange={(e) =>
+              setBindType(e.currentTarget.value as "prefix" | "host")
+            }
+          >
+            <option value="prefix">URL prefix (this host)</option>
+            <option value="host">Hostname</option>
+          </Select>
+          <label for="space-bind-value">
+            {bindType === "prefix" ? "Prefix" : "Hostname"}
+          </label>
+          {bindType === "prefix" ? (
+            <UrlPrefixInput
+              id="space-bind-value"
+              origin={location.origin}
+              value={prefix}
+              onInput={setPrefix}
+            />
+          ) : (
+            <div class="sb-url-input">
+              {/* Only the scheme is fixed, and it is always https://: SilverBullet
               requires TLS, and a host-bound space is reached through whatever
               proxy terminates it — never on this server's own listening port.
               Nothing follows the hostname, so there is no trailing affix; a
               bare "/" only added noise. */}
-          <span class="sb-url-affix">https://</span>
+              <span class="sb-url-affix">https://</span>
+              <Input
+                id="space-bind-value"
+                value={hostValue}
+                placeholder="notes.example.com"
+                onInput={(e) => setHostValue(e.currentTarget.value)}
+              />
+            </div>
+          )}
+          {bindType === "host" && hostStatus && (
+            <Fragment>
+              {hostStatus === "verified" && (
+                <span class="sb-spaces-ok">✓ hostname reaches this server</span>
+              )}
+              {hostStatus === "mismatch" && (
+                <span class="sb-spaces-error">
+                  hostname reaches a different server
+                </span>
+              )}
+              {hostStatus === "unreachable" && (
+                <span class="sb-spaces-warn">
+                  could not verify: hostname does not reach this server from
+                  your browser (DNS or proxy not set up yet?)
+                </span>
+              )}
+            </Fragment>
+          )}
+          {bindType === "prefix" && (
+            <p class="sb-help-text">
+              For added security, you can bind a space to its own hostname
+              (instead of a URL prefix) to better isolate it from your other
+              spaces.
+            </p>
+          )}
+          <label for="space-folder">Folder</label>
+          <FolderPicker
+            id="space-folder"
+            value={folder}
+            onChange={setFolder}
+            apiBase="api/admin"
+            browseStart={folderTouched ? undefined : "spaces"}
+          />
+          <label for="space-index-page">Start page</label>
           <Input
-            id="space-bind-value"
-            value={hostValue}
-            placeholder="notes.example.com"
-            onInput={(e) => setHostValue(e.currentTarget.value)}
+            id="space-index-page"
+            value={indexPage}
+            onInput={(e) => setIndexPage(e.currentTarget.value)}
           />
         </div>
-      )}
-      {bindType === "host" && hostStatus && (
-        <Fragment>
-          {hostStatus === "verified" && (
-            <span class="sb-spaces-ok">✓ hostname reaches this server</span>
-          )}
-          {hostStatus === "mismatch" && (
-            <span class="sb-spaces-error">
-              hostname reaches a different server
-            </span>
-          )}
-          {hostStatus === "unreachable" && (
-            <span class="sb-spaces-warn">
-              could not verify: hostname does not reach this server from your
-              browser (DNS or proxy not set up yet?)
-            </span>
-          )}
-        </Fragment>
-      )}
-      {bindType === "prefix" && (
-        <p class="sb-help-text">
-          For added security, you can bind a space to its own hostname (instead
-          of a URL prefix) to better isolate it from your other spaces.
-        </p>
-      )}
-      <label for="space-folder">Folder</label>
-      <FolderPicker
-        id="space-folder"
-        value={folder}
-        onChange={setFolder}
-        apiBase="api/admin"
-        browseStart={folderTouched ? undefined : "spaces"}
-      />
-      <h3>Access</h3>
-      <fieldset class="sb-access-table">
-        <legend>Who has access</legend>
-        <p class="sb-help-text">
-          Note: write members can also author scripts (Space Lua, install libraries and plugs) that run for anyone
-          who opens this space.
-        </p>
-        <div class="sb-access-row sb-access-public">
-          <span class="sb-access-who">Public (not signed in)</span>
-          <Select
-            value={access}
-            onChange={(e) => setAccess(e.currentTarget.value as SpaceAccess)}
-          >
-            <option value="none">No access</option>
-            <option value="read">Read</option>
-            <option value="write" disabled={readOnly}>
-              Read &amp; write
-            </option>
-          </Select>
-        </div>
-        {access === "read" && (
-          <Alert variant="info">
-            Anyone can read this space without signing in. Page history and
-            revisions stay members-only.
-          </Alert>
-        )}
-        {access === "write" && !readOnly && (
-          <Alert variant="warning">
-            Anyone on the internet can read AND EDIT this space without signing
-            in. Only use for auth-proxy or VPN deployments.
-          </Alert>
-        )}
-        {usersError && (
-          <Alert variant="error">
-            Could not load users:{" "}
-            <a
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                loadUsers();
-              }}
-            >
-              retry
-            </a>
-          </Alert>
-        )}
-        {!usersError && Object.keys(users).length === 0 && (
-          <p>No other users yet — create some in the Users tab.</p>
-        )}
-        {Object.entries(users)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([username, u]) => (
-            <div class="sb-access-row" key={username}>
-              <span class="sb-access-who">
-                {username}
-                {u.admin && <Badge>admin</Badge>}
-              </span>
-              {u.admin ? (
-                <span class="sb-access-fixed">Full access</span>
-              ) : (
-                <Select
-                  value={members[username] ?? "none"}
-                  onChange={(e) => {
-                    const role = e.currentTarget.value;
-                    setMembers((prev) => {
-                      const next = { ...prev };
-                      if (role === "none") delete next[username];
-                      else next[username] = role as MemberRole;
-                      return next;
-                    });
+        <div hidden={!visible("access")}>
+          <fieldset class="sb-access-table">
+            <legend>Who has access</legend>
+            <p class="sb-help-text">
+              Note: write members can also author scripts (Space Lua, install
+              libraries and plugs) that run for anyone who opens this space.
+            </p>
+            <div class="sb-access-row sb-access-public">
+              <span class="sb-access-who">Public (not signed in)</span>
+              <Select
+                value={access}
+                onChange={(e) =>
+                  setAccess(e.currentTarget.value as SpaceAccess)
+                }
+              >
+                <option value="none">No access</option>
+                <option value="read">Read</option>
+                <option value="write" disabled={readOnly}>
+                  Read &amp; write
+                </option>
+              </Select>
+            </div>
+            {access === "read" && (
+              <Alert variant="info">
+                Anyone can read this space without signing in. Page history and
+                revisions stay members-only.
+              </Alert>
+            )}
+            {access === "write" && !readOnly && (
+              <Alert variant="warning">
+                Anyone on the internet can read AND EDIT this space without
+                signing in. Only use for auth-proxy or VPN deployments.
+              </Alert>
+            )}
+            {usersError && (
+              <Alert variant="error">
+                Could not load users:{" "}
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    loadUsers();
                   }}
                 >
-                  <option value="none">No access</option>
-                  <option value="read">Read</option>
-                  <option value="write" disabled={readOnly}>
-                    Read &amp; write
-                  </option>
-                </Select>
-              )}
-            </div>
-          ))}
-        {readOnly && (
-          <p class="sb-help-text">
-            Write access is disabled while this space is frozen.
-          </p>
-        )}
-      </fieldset>
-      <label>
-        <Checkbox
-          checked={readOnly}
-          onChange={(e) => setReadOnly(e.currentTarget.checked)}
-        />{" "}
-        Freeze this space
-        <span class="sb-help-text">Nobody can write, including admins.</span>
-      </label>
-      <h3>Revisions</h3>
-      <label for="space-revisions">Mode</label>
-      <Select
-        id="space-revisions"
-        value={revisions}
-        onChange={(e) => setRevisions(e.currentTarget.value as RevisionsMode)}
-      >
-        <option value="disabled">
-          Disabled — revision support switched off entirely
-        </option>
-        <option value="managed">
-          Managed — SilverBullet periodically commits automatically
-        </option>
-        <option value="unmanaged">
-          Unmanaged — show revisions only, no auto commit
-        </option>
-      </Select>
-      <h3>Options</h3>
-      <label>
-        <Checkbox
-          checked={shellEnabled}
-          onChange={(e) => setShellEnabled(e.currentTarget.checked)}
-        />{" "}
-        Enable shell commands
-        <span class="sb-help-text">
-          For added security, leave shell off unless this space needs to run
-          server commands.
-        </span>
-      </label>
-      {/* Only meaningful while shell commands are on, so it appears with
-          them rather than sitting there greyed out. */}
-      {shellEnabled && (
-        <Fragment>
-          <label for="space-shell-whitelist">
-            Allowed commands
+                  retry
+                </a>
+              </Alert>
+            )}
+            {!usersError && Object.keys(users).length === 0 && (
+              <p>No other users yet — create some in the Users tab.</p>
+            )}
+            {Object.entries(users)
+              .sort((a, b) => a[0].localeCompare(b[0]))
+              .map(([username, u]) => (
+                <div class="sb-access-row" key={username}>
+                  <span class="sb-access-who">
+                    {username}
+                    {u.admin && <Badge>admin</Badge>}
+                  </span>
+                  {u.admin ? (
+                    <span class="sb-access-fixed">Full access</span>
+                  ) : (
+                    <Select
+                      value={members[username] ?? "none"}
+                      onChange={(e) => {
+                        const role = e.currentTarget.value;
+                        setMembers((prev) => {
+                          const next = { ...prev };
+                          if (role === "none") delete next[username];
+                          else next[username] = role as MemberRole;
+                          return next;
+                        });
+                      }}
+                    >
+                      <option value="none">No access</option>
+                      <option value="read">Read</option>
+                      <option value="write" disabled={readOnly}>
+                        Read &amp; write
+                      </option>
+                    </Select>
+                  )}
+                </div>
+              ))}
+            {readOnly && (
+              <p class="sb-help-text">
+                Write access is disabled while this space is frozen.
+              </p>
+            )}
+          </fieldset>
+          <label>
+            <Checkbox
+              checked={readOnly}
+              onChange={(e) => setReadOnly(e.currentTarget.checked)}
+            />{" "}
+            Freeze this space
             <span class="sb-help-text">
-              Space-separated. Leave empty to allow every command.
+              Nobody can write, including admins.
             </span>
           </label>
-          <Input
-            id="space-shell-whitelist"
-            value={shellWhitelist}
-            placeholder="git pandoc"
-            onInput={(e) => setShellWhitelist(e.currentTarget.value)}
-          />
-        </Fragment>
-      )}
-      {/* The stored flag and its availability stay orthogonal: `runtimeApi`
+        </div>
+        <div hidden={!visible("revisions")}>
+          <label for="space-revisions">Mode</label>
+          <Select
+            id="space-revisions"
+            disabled={connectionDraft}
+            aria-describedby={
+              connectionDraft ? "revision-mode-help" : undefined
+            }
+            value={revisions}
+            onChange={(e) =>
+              setRevisions(e.currentTarget.value as RevisionsMode)
+            }
+          >
+            <option value="disabled">
+              Disabled — revision support switched off entirely
+            </option>
+            <option value="managed">
+              Managed — SilverBullet periodically commits automatically
+            </option>
+            <option value="unmanaged">
+              Unmanaged — show revisions only, no auto commit
+            </option>
+          </Select>
+          {connectionDraft && (
+            <p id="revision-mode-help" class="sb-help-text">
+              Finish or cancel Git setup below before changing revision mode.
+            </p>
+          )}
+          {revisions === "managed" && (
+            <Fragment>
+              <label for="space-commit-frequency">Commit frequency</label>
+              <Select
+                id="space-commit-frequency"
+                value={(() => {
+                  const i = COMMIT_PRESETS.findIndex(
+                    (p) =>
+                      p.quietSecs === revisionsCommit.quietSecs &&
+                      p.maxIntervalSecs === revisionsCommit.maxIntervalSecs,
+                  );
+                  return i >= 0 ? String(i) : "custom";
+                })()}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  if (v === "custom") return;
+                  const preset = COMMIT_PRESETS[Number(v)];
+                  setRevisionsCommit({
+                    quietSecs: preset.quietSecs,
+                    maxIntervalSecs: preset.maxIntervalSecs,
+                  });
+                }}
+              >
+                {COMMIT_PRESETS.map((p, i) => (
+                  <option value={String(i)} key={p.label}>
+                    {p.label}
+                  </option>
+                ))}
+                {!COMMIT_PRESETS.some(
+                  (p) =>
+                    p.quietSecs === revisionsCommit.quietSecs &&
+                    p.maxIntervalSecs === revisionsCommit.maxIntervalSecs,
+                ) && (
+                  <option value="custom" disabled>
+                    {`Custom (${formatDuration(revisionsCommit.quietSecs)} / ${formatDuration(
+                      revisionsCommit.maxIntervalSecs,
+                    )})`}
+                  </option>
+                )}
+              </Select>
+            </Fragment>
+          )}
+        </div>
+        <div hidden={!visible("advanced")}>
+          <h3>Shell commands</h3>
+          <label>
+            <Checkbox
+              checked={shellEnabled}
+              onChange={(e) => setShellEnabled(e.currentTarget.checked)}
+            />{" "}
+            Enable shell commands
+            <span class="sb-help-text">
+              For added security, leave shell off unless this space needs to run
+              server commands.
+            </span>
+          </label>
+          {/* Only meaningful while shell commands are on, so it appears with
+          them rather than sitting there greyed out. */}
+          {shellEnabled && (
+            <Fragment>
+              <label for="space-shell-whitelist">
+                Allowed commands
+                <span class="sb-help-text">
+                  Space-separated. Leave empty to allow every command.
+                </span>
+              </label>
+              <Input
+                id="space-shell-whitelist"
+                value={shellWhitelist}
+                placeholder="git pandoc"
+                onInput={(e) => setShellWhitelist(e.currentTarget.value)}
+              />
+            </Fragment>
+          )}
+          {/* The stored flag and its availability stay orthogonal: `runtimeApi`
           means "this space wants the runtime API", availability means "this
           server can currently provide it". Locking the control does not
           rewrite the value, so installing Chrome and restarting lights the
           space up without the admin having to come back here. */}
-      <label>
-        <Checkbox
-          checked={runtimeApi}
-          disabled={runtimeApiUnavailable !== null}
-          onChange={(e) => setRuntimeApi(e.currentTarget.checked)}
-        />{" "}
-        Enable runtime API
-        {runtimeApiUnavailable && (
-          <span class="sb-help-text">{runtimeApiUnavailable}</span>
-        )}
-      </label>
-      <label for="space-index-page">Index page</label>
-      <Input
-        id="space-index-page"
-        value={indexPage}
-        onInput={(e) => setIndexPage(e.currentTarget.value)}
-      />
+          <label>
+            <Checkbox
+              checked={runtimeApi}
+              disabled={runtimeApiUnavailable !== null}
+              onChange={(e) => setRuntimeApi(e.currentTarget.checked)}
+            />{" "}
+            Enable runtime API
+            {runtimeApiUnavailable && (
+              <span class="sb-help-text">{runtimeApiUnavailable}</span>
+            )}
+          </label>
+        </div>
+      </fieldset>
       <div class="row">
         <Button
           type="submit"
           variant="primary"
-          disabled={saveState === "saving"}
+          disabled={
+            saveState === "saving" || modeBlocked || (!!id && !activeDirty)
+          }
         >
-          {saveState === "saving" ? "Saving…" : id ? "Save" : "Create"}
+          {saveState === "saving" ? "Saving…" : id ? "Save changes" : "Create"}
         </Button>
-        <a class="sb-button" href={cancelHref}>
-          Cancel
-        </a>
+        {!id && (
+          <a class="sb-button" href={cancelHref}>
+            Cancel
+          </a>
+        )}
+        {savedSection === section && !activeDirty && (
+          <span role="status">Saved</span>
+        )}
       </div>
-      {id && (
+      {id && section === "general" && (
         <div class="sb-danger-zone">
+          <h3>Remove space</h3>
+          <p class="sb-help-text">
+            Remove this space from the server. Files on disk are kept.
+          </p>
           <Button
+            type="button"
             variant="danger"
             onClick={async () => {
               if (
@@ -498,6 +634,7 @@ export function SpaceForm({
                 await adminApi("DELETE", `spaces/${id}`);
                 onDeleted();
               } catch (errs) {
+                setErrorSection("general");
                 if ((errs as any)?.unauthorized) {
                   onUnauthorized();
                   return;
@@ -510,7 +647,7 @@ export function SpaceForm({
               }
             }}
           >
-            Delete space
+            Remove space
           </Button>
         </div>
       )}

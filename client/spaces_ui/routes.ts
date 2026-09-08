@@ -1,3 +1,4 @@
+import { SPACE_SECTIONS, type SpaceSection } from "./space_settings.ts";
 export const SPACES_BASE = new URL(document.baseURI).pathname.replace(
   /\/+$/,
   "",
@@ -7,7 +8,8 @@ export type SpacesRoute =
   | { screen: "login"; next?: string }
   | { screen: "spaces" }
   | { screen: "space-new" }
-  | { screen: "space"; id: string }
+  | { screen: "space"; id: string; section?: SpaceSection }
+  | { screen: "space-git"; id: string }
   | { screen: "users" }
   | { screen: "user-new" }
   | { screen: "user"; username: string }
@@ -59,11 +61,20 @@ export function parseSpacesRoute(): SpacesRoute {
     const username = decoded(segments[1]);
     if (segments.length === 2 && username) return { screen: "user", username };
   }
+  if (segments.length === 2 && segments[1] === "git") {
+    const id = decoded(segments[0]);
+    if (id) return { screen: "space-git", id };
+  }
   // A bare single segment is a space id. Checked last so "new", "users" and
   // "login" above win, mirroring matchit's static-over-param precedence.
   if (segments.length === 1) {
     const id = decoded(segments[0]);
-    if (id) return { screen: "space", id };
+    if (id) {
+      const section = new URLSearchParams(location.search).get("section");
+      return section && Object.hasOwn(SPACE_SECTIONS, section)
+        ? { screen: "space", id, section: section as SpaceSection }
+        : { screen: "space", id };
+    }
   }
   return { screen: "not-found" };
 }
