@@ -433,6 +433,7 @@ export function NavRoot({
             rows={listItems}
             selectedIndex={activeIndex}
             showEmpty={!canCreate}
+            emptyText={view.meta.emptyText}
             actions={view.meta.actions}
             actionIcons={view.actionIcons}
             rowState={view.rowState}

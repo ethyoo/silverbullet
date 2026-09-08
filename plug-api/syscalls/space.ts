@@ -283,3 +283,42 @@ export function getSpaceLog(before?: string, q?: string): Promise<SpaceLog> {
 export function createRevisionSnapshot(): Promise<boolean> {
   return syscall("space.createRevisionSnapshot");
 }
+
+export function getGitSyncStatus(): Promise<
+  import("../types/revisions.ts").GitSyncSnapshot
+> {
+  return syscall("space.getGitSyncStatus");
+}
+
+export function getGitConflicts(): Promise<
+  import("../types/revisions.ts").GitConflicts
+> {
+  return syscall("space.getGitConflicts");
+}
+
+export function syncGitNow(): Promise<void> {
+  return syscall("space.syncGitNow");
+}
+
+export function resolveGitConflict(
+  id: string,
+  generation: string,
+  contentRevision: string,
+  action: import("../types/revisions.ts").GitConflictAction,
+): Promise<import("../types/revisions.ts").GitConflicts> {
+  return syscall(
+    "space.resolveGitConflict",
+    id,
+    generation,
+    contentRevision,
+    action,
+  );
+}
+
+export function getGitConflictVersion(
+  id: string,
+  generation: string,
+  side: "local" | "remote",
+): Promise<Uint8Array> {
+  return syscall("space.getGitConflictVersion", id, generation, side);
+}

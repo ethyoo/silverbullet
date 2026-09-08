@@ -41,11 +41,23 @@ export function AnchoredMenu({
       }
     };
     const onResize = () => onCloseRef.current();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (ref.current?.contains(event.target as Node)) event.stopPropagation();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+        trigger.focus();
+      }
+    };
+    ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    document.addEventListener("keydown", onKeyDown);
     document.addEventListener("pointerdown", onPointer);
     // Placement is measured once, so a resize would leave the menu behind.
     globalThis.addEventListener("resize", onResize);
     return () => {
       document.removeEventListener("pointerdown", onPointer);
+      document.removeEventListener("keydown", onKeyDown);
       globalThis.removeEventListener("resize", onResize);
     };
   }, [trigger]);

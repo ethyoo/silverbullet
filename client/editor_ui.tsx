@@ -28,7 +28,7 @@ import { AnchoredMenu } from "./components/anchored_menu.tsx";
 import {
   ProfileAvatar,
   profileMenuHeader,
-  profileMenuItems,
+  editorProfileMenuItems,
   profileMenuLabel,
 } from "./components/profile_button.tsx";
 import { loadProfile, type ProfileState } from "./profile.ts";
@@ -54,6 +54,11 @@ export class MainUI {
     globalThis.addEventListener(
       "keydown",
       (ev) => {
+        if (
+          ev.target instanceof Element &&
+          ev.target.closest(".sb-anchored-menu")
+        )
+          return;
         const cmd = isMacLike ? ev.metaKey : ev.ctrlKey;
         if (!cmd || ev.altKey || ev.shiftKey || ev.key.toLowerCase() !== "o") {
           return;
@@ -151,7 +156,7 @@ export class MainUI {
       timeout?: number;
       actions?: NotificationAction[];
     },
-  ) {
+  ): number {
     const id = Math.floor(Math.random() * 1000000);
     const dismiss = () => {
       this.viewDispatch({ type: "dismiss-notification", id });
@@ -179,6 +184,11 @@ export class MainUI {
       const timeout = options?.timeout ?? notificationDismissTimeouts[type];
       setTimeout(dismiss, timeout);
     }
+    return id;
+  }
+
+  dismissNotification(id: number) {
+    this.viewDispatch({ type: "dismiss-notification", id });
   }
 
   private dispatchProgressState() {
@@ -552,7 +562,7 @@ export class MainUI {
                     : undefined,
                   callback: isProfileButton
                     ? (el?: HTMLElement) => {
-                        const items = profileMenuItems(profile, client);
+                        const items = editorProfileMenuItems(profile, client);
                         if (viewState.isMobile || !el) {
                           void client.ui
                             .filterBox(
@@ -604,7 +614,7 @@ export class MainUI {
           <AnchoredMenu
             trigger={menuTrigger}
             header={profileMenuHeader(profile)}
-            items={profileMenuItems(profile, client)}
+            items={editorProfileMenuItems(profile, client)}
             onClose={() => setMenuTrigger(undefined)}
           />
         )}

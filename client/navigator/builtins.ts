@@ -10,7 +10,12 @@ import { RESERVED_KEYS } from "./lua_views.ts";
 import type { NavigatorHook, Row, SourceCtx, ViewMeta } from "./types.ts";
 import { anchorPicker } from "./views/anchors.ts";
 import { commandPalette } from "./views/commands.ts";
-import { pageHistoryView, spaceLogView } from "./views/revisions.ts";
+import {
+  pageHistoryView,
+  spaceLogView,
+  gitConflictsView,
+  gitStatusView,
+} from "./views/revisions.ts";
 import { pagePicker } from "./views/pages.ts";
 import { spaceTreeView } from "./views/space_tree.ts";
 import { tagPicker } from "./views/tags.ts";
@@ -33,6 +38,8 @@ const views: Record<string, BuiltinView<any>> = {
   "std.spaceTree": spaceTreeView,
   "std.pageHistory": pageHistoryView,
   "std.spaceLog": spaceLogView,
+  "std.gitConflicts": gitConflictsView,
+  "std.gitStatus": gitStatusView,
 };
 
 // A built-in claiming one of these would silently shadow panel navigation
@@ -56,15 +63,23 @@ export function validateKeymaps(
 validateKeymaps(views);
 
 let revisionsAvailable = false;
+let gitAvailable = false;
 
 const REVISION_VIEWS = new Set(["std.pageHistory", "std.spaceLog"]);
 
-export function setRevisionsAvailable(available: boolean): void {
+export function setRevisionsAvailable(
+  available: boolean,
+  readableGit = available,
+): void {
   revisionsAvailable = available;
+  gitAvailable = readableGit;
 }
 
 function hidden(name: string): boolean {
-  return REVISION_VIEWS.has(name) && !revisionsAvailable;
+  return (
+    (REVISION_VIEWS.has(name) && !revisionsAvailable) ||
+    ((name === "std.gitConflicts" || name === "std.gitStatus") && !gitAvailable)
+  );
 }
 
 export function builtinViewNames(): string[] {

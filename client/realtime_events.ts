@@ -6,7 +6,12 @@
  * unavailable, the subscriber keeps probing in the background every 60s and
  * reconnects immediately on the browser's 'online' event, with the client's
  * polling as the backstop in the meantime.
+ *
+ * The stream also carries a named `sync` event (see `onSyncState`), which
+ * the server sends only on a `SyncState` transition.
  */
+
+import type { SyncState } from "@silverbulletmd/silverbullet/type/revisions";
 
 export type RealtimeFsEventRevision = {
   algorithm: string;
@@ -79,8 +84,16 @@ export class RealtimeEvents {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private loggedUnsupported = false;
   private lastHeartbeatAt = 0;
+  private syncListeners: ((s: SyncState) => void)[] = [];
 
   constructor(private hooks: RealtimeHooks) {}
+
+  /** Registers a listener for the named `sync` SSE event, which the server
+   * sends only on a `SyncState` transition (never every tick). Client-level,
+   * not panel-scoped: a caller must not need Space History open to hear it. */
+  onSyncState(cb: (s: SyncState) => void) {
+    this.syncListeners.push(cb);
+  }
 
   start(url: string) {
     this.stopped = false;
@@ -117,6 +130,17 @@ export class RealtimeEvents {
     this.lastHeartbeatAt = 0;
     this.hooks.notifyStatus(false);
   }
+
+  private onSyncEvent = (evt: Event) => {
+    this.onReceipt();
+    const data = (evt as MessageEvent).data;
+    try {
+      const state = JSON.parse(data) as SyncState;
+      for (const cb of this.syncListeners) cb(state);
+    } catch (e) {
+      console.warn("[realtime] Could not parse sync event", data, e);
+    }
+  };
 
   private onOnline = () => {
     // Only act when a reconnect is pending: a healthy connection needs no
@@ -161,6 +185,7 @@ export class RealtimeEvents {
     // surfaces SSE comments, so on a quiet stream this is the only proof of
     // liveness the browser gets. Carries no payload.
     source.addEventListener("ping", this.onReceipt);
+    source.addEventListener("sync", this.onSyncEvent);
     source.onerror = () => {
       // A fatal error (404, wrong content-type) sets readyState to CLOSED
       // before onerror fires; a transient one (connection refused, DNS

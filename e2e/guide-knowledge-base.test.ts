@@ -123,3 +123,35 @@ test.describe("Guide: Knowledge Base", () => {
     await expect(editor).toContainText("Invisible Cities", { timeout: 20_000 });
   });
 });
+
+test.describe("interrupted script reindex", () => {
+  test.use({
+    spaceFiles: {
+      "index.md": "# Notebook\n",
+      "Currently Reading.md": CURRENTLY_READING,
+      "Invisible Cities.md":
+        "---\ntags: book\nstatus: reading\n---\nA sample book.\n",
+    },
+  });
+  test("reload repairs leased index work before loading Space Lua", async ({
+    sbPage,
+    sbServer,
+  }) => {
+    await sbPage.evaluate(async () => {
+      const client = (globalThis as any).client;
+      await client.objectIndex.awaitIndexQueueDrain();
+      client.clientSystem.mqHook.stop();
+      await client.mq.batchSend("indexQueue", ["Library/Std/APIs/Template.md"]);
+      await client.mq.poll("indexQueue", 1000);
+      await client.objectIndex.clearFileIndex("Library/Std/APIs/Template.md");
+    });
+    await gotoSilverBulletPage(sbPage, sbServer, "Currently Reading");
+    await expect(sbPage.locator("#sb-editor .cm-content")).toContainText(
+      "Invisible Cities",
+      { timeout: 25000 },
+    );
+    await expect(sbPage.locator("#sb-editor .cm-content")).not.toContainText(
+      "Lua error",
+    );
+  });
+});

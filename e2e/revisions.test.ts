@@ -380,21 +380,36 @@ test.describe("Space History", () => {
       "Space History",
     );
 
-    // Collapsed by default: the uncommitted entry plus the two commits, no
-    // children showing under any of them.
-    await expect(frame.locator(".sb-nav-row")).toHaveCount(3);
+    const historyLabels = frame.locator(".sb-nav-primary").filter({
+      hasText: /^(Uncommitted changes|Update A|Initial space snapshot|.*\.md)$/,
+    });
+    await expect(historyLabels).toHaveText([
+      "Uncommitted changes",
+      "Update A",
+      "Initial space snapshot",
+    ]);
     const bobRow = frame.locator(".sb-nav-row", { hasText: "Bob" });
     await expect(bobRow.locator(".sb-nav-primary")).toHaveText("Update A");
     await expect(bobRow.locator(".sb-nav-chip").first()).toHaveText("Bob");
 
     // Selecting the commit itself opens it up. Bob's touched only page-a.md.
     await bobRow.click();
-    await expect(frame.locator(".sb-nav-row")).toHaveCount(4);
+    await expect(historyLabels).toHaveText([
+      "Uncommitted changes",
+      "Update A",
+      "page-a.md",
+      "Initial space snapshot",
+    ]);
     const fileRow = frame.locator(".sb-nav-row", { hasText: "page-a.md" });
     await expect(fileRow.locator(".sb-nav-primary")).toHaveText("page-a.md");
     // Clicking it again keeps it open rather than toggling it shut.
     await bobRow.click();
-    await expect(frame.locator(".sb-nav-row")).toHaveCount(4);
+    await expect(historyLabels).toHaveText([
+      "Uncommitted changes",
+      "Update A",
+      "page-a.md",
+      "Initial space snapshot",
+    ]);
 
     // A page row previews it, exactly like a Page History row does.
     await fileRow.click();
@@ -447,10 +462,11 @@ test.describe("Uncommitted changes", () => {
     const uncommitted = frame.locator(".sb-nav-row", {
       hasText: "Uncommitted changes",
     });
-    // Ahead of the baseline commit, and carrying no diff/time chips.
-    await expect(frame.locator(".sb-nav-row").first()).toContainText(
-      "Uncommitted changes",
-    );
+    await expect(
+      frame.locator(".sb-nav-primary").filter({
+        hasText: /^(Uncommitted changes|Initial space snapshot|.*\.md)$/,
+      }),
+    ).toHaveText(["Uncommitted changes", "Initial space snapshot"]);
     await expect(uncommitted.locator(".sb-nav-chip")).toHaveCount(0);
 
     await uncommitted.click();

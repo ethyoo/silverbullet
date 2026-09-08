@@ -134,7 +134,7 @@ export class ClientSystem {
 
     setInterval(() => {
       mq.requeueTimeouts(mqTimeout, mqTimeoutRetry, true).catch(console.error);
-    }, 20000);
+    }, mqTimeout / 2);
 
     this.system.addHook(this.eventHook);
 
@@ -149,13 +149,16 @@ export class ClientSystem {
 
     this.commandHook = new CommandHook(this.readOnlyMode, this.scriptCommands);
     registerEditorCommands(client, this.commandHook);
-    // Read-only spaces get no revision surface at all
-    const revisionsAvailable =
-      !this.readOnlyMode &&
+    const gitAvailable =
       !!this.client.bootConfig.revisions &&
       this.client.bootConfig.revisions !== "disabled";
-    setRevisionsAvailable(revisionsAvailable);
-    registerNavigatorCommands(this.commandHook, revisionsAvailable);
+    const revisionsAvailable = !this.readOnlyMode && gitAvailable;
+    setRevisionsAvailable(revisionsAvailable, gitAvailable);
+    registerNavigatorCommands(
+      this.commandHook,
+      revisionsAvailable,
+      gitAvailable,
+    );
     setViewDefaults(resolveViewDefaults(this.client.config));
     this.commandHook.on({
       commandsUpdated: (commandMap) => {

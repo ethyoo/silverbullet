@@ -29,6 +29,7 @@ import type {
   FileMeta,
   PageMeta,
 } from "@silverbulletmd/silverbullet/type/index";
+import type { SyncState } from "@silverbulletmd/silverbullet/type/revisions";
 import { keyboardHint } from "../plug-api/lib/shortcut.ts";
 import type { StyleObject } from "../plugs/index/space_style.ts";
 import type { ResolveAnchorResult } from "../plugs/index/types.ts";
@@ -54,6 +55,14 @@ import { isValidEditor } from "./lib/command_filters.ts";
 import { isMobileDevice } from "./lib/mobile.ts";
 import { timedSpan } from "./lib/perf.ts";
 import { open as openNavigatorView } from "./navigator/navigator.ts";
+import {
+  REVISIONS_CHANGED_EVENT,
+  SYNC_CONFLICT,
+  SYNC_ERROR,
+  SYNC_PAUSED,
+} from "./navigator/views/revisions.ts";
+import { setGitSyncStreamConnected } from "./git_sync_status.ts";
+import { shouldFlashSyncNotification } from "./sync_notification.ts";
 import { PathPageNavigator, parseRefFromURI } from "./navigator.ts";
 import { EventHook } from "./plugos/hooks/event.ts";
 import {
@@ -155,12 +164,8 @@ export class Client {
   eventedSpacePrimitives!: EventedSpacePrimitives;
   httpSpacePrimitives!: HttpSpacePrimitives;
   realtimeEvents?: RealtimeEvents;
-  // Attribution for recently-received realtime change events, keyed by path.
-  // A map with a TTL rather than a single "pending" slot: between the SSE
-  // event and the file:changed dispatch sit a sync round-trip and an
-  // EventedSpacePrimitives whose operationCount gate makes it unpredictable
-  // WHICH concurrent metadata fetch ends up dispatching the event — a slot
-  // tied to one call's lifetime loses the origin whenever calls overlap.
+  private syncNotificationId?: number;
+  private lastSyncState?: SyncState;
   private realtimeOrigins = new Map<
     string,
     { origin: RealtimeFsEventOrigin; time: number }
@@ -359,9 +364,21 @@ export class Client {
     await timedSpan("load-plugs", () => this.loadPlugs());
     performance.mark("sb:plugs-loaded");
 
-    await timedSpan("load-lua-scripts", () =>
-      this.clientSystem.loadLuaScripts(),
-    );
+    if (
+      this.fullIndexCompleted &&
+      !(await this.mq.isQueueEmpty("indexQueue"))
+    ) {
+      // A reload can interrupt replacement of indexed scripts after their
+      // old records were cleared. Recover the queued work before reading them.
+      void this.objectIndex
+        .awaitIndexQueueDrain()
+        .then(() => this.eventHook.dispatchEvent("editor:reloadState"))
+        .catch(console.error);
+    } else {
+      await timedSpan("load-lua-scripts", () =>
+        this.clientSystem.loadLuaScripts(),
+      );
+    }
     await timedSpan("init-navigator", () => this.initNavigator());
     await this.eventHook.dispatchEvent("system:ready");
     this.systemReady = true;
@@ -539,15 +556,80 @@ export class Client {
       serviceWorkerActive: () =>
         !!globalThis.navigator?.serviceWorker?.controller,
       notifyStatus: (connected) => {
+        if (setGitSyncStreamConnected(connected)) {
+          void this.eventHook.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
+        }
         void this.postServiceWorkerMessage({
           type: "realtime-status",
           connected,
         });
       },
     });
+    this.realtimeEvents.onSyncState((state) => this.handleSyncState(state));
     this.realtimeEvents.start(
       `${document.baseURI.replace(/\/*$/, "")}/.events`,
     );
+  }
+
+  private handleSyncState(state: SyncState) {
+    void this.eventHook.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
+
+    const isNewProblem = shouldFlashSyncNotification(state, this.lastSyncState);
+    this.lastSyncState = state;
+
+    if (state.state === "conflicted" && state.paths.length > 0) {
+      if (!isNewProblem) return;
+      this.flashSyncNotification(SYNC_CONFLICT(state.paths.length), [
+        {
+          name: "Review conflicts",
+          run: () => {
+            void this.openNavigatorView("std.gitConflicts");
+          },
+        },
+      ]);
+      return;
+    }
+    if (state.state === "error") {
+      if (!isNewProblem) return;
+      this.flashSyncNotification(SYNC_ERROR, [
+        {
+          name: "View Git status",
+          run: () => {
+            void this.openNavigatorView("std.gitStatus");
+          },
+        },
+      ]);
+      return;
+    }
+    if (state.state === "paused") {
+      if (!isNewProblem) return;
+      this.flashSyncNotification(SYNC_PAUSED(state.reason), [
+        {
+          name: "View Git status",
+          run: () => {
+            void this.openNavigatorView("std.gitStatus");
+          },
+        },
+      ]);
+      return;
+    }
+    if (this.syncNotificationId !== undefined) {
+      this.ui.dismissNotification(this.syncNotificationId);
+      this.syncNotificationId = undefined;
+    }
+  }
+
+  private flashSyncNotification(
+    message: string,
+    actions: { name: string; run: () => void }[],
+  ) {
+    if (this.syncNotificationId !== undefined) {
+      this.ui.dismissNotification(this.syncNotificationId);
+    }
+    this.syncNotificationId = this.ui.flashNotification(message, "error", {
+      timeout: 0,
+      actions,
+    });
   }
 
   currentPath(): Path {

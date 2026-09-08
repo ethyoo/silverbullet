@@ -1,5 +1,12 @@
 import { isolateHistory } from "@codemirror/commands";
-import type { EditorState, Line, Range, Text } from "@codemirror/state";
+import {
+  type EditorState,
+  type Line,
+  type Range,
+  type Text,
+  StateEffect,
+  StateField,
+} from "@codemirror/state";
 import { Decoration, WidgetType } from "@codemirror/view";
 import type { Client } from "../client.ts";
 import {
@@ -8,17 +15,26 @@ import {
   isCursorInRange,
 } from "./util.ts";
 
+const editConflictManually = StateEffect.define<number>();
+const compareConflict = StateEffect.define<number>();
+const manualConflicts = StateField.define<number[]>({
+  create: () => [],
+  update: (positions, transaction) => {
+    let next = positions.map((position) =>
+      transaction.changes.mapPos(position),
+    );
+    for (const effect of transaction.effects) {
+      if (effect.is(editConflictManually)) next.push(effect.value);
+      if (effect.is(compareConflict))
+        next = next.filter((position) => position !== effect.value);
+    }
+    return next;
+  },
+});
+
 const SB_START_PREFIX = "<<<<<<< SB sha256:";
 const SB_BASE_PREFIX = "||||||| SB BASE sha256:";
-const SEPARATOR_LINE = "=======";
 const SB_END_PREFIX = ">>>>>>> SB sha256:";
-
-// Git's own markers ("<<<<<<< HEAD", optional diff3 "||||||| …" base,
-// "=======", ">>>>>>> branch") share the outer shape but never carry "SB
-// sha256:" — SB is checked first everywhere, so it's never mistaken for git.
-const GIT_START_PREFIX = "<<<<<<<";
-const GIT_BASE_PREFIX = "|||||||";
-const GIT_END_PREFIX = ">>>>>>>";
 
 export type ConflictKind = "sb" | "git";
 
@@ -50,6 +66,7 @@ function splitLabel(rest: string): string {
 }
 
 interface MarkerMatch {
+  markerSize: number;
   kind: ConflictKind;
   hash: string;
   label?: string;
@@ -58,13 +75,19 @@ interface MarkerMatch {
 function matchStartLine(lineText: string): MarkerMatch | null {
   const stripped = stripTrailingCR(lineText);
   if (stripped.startsWith(SB_START_PREFIX)) {
-    return { kind: "sb", hash: stripped.slice(SB_START_PREFIX.length) };
+    return {
+      kind: "sb",
+      markerSize: 7,
+      hash: stripped.slice(SB_START_PREFIX.length),
+    };
   }
-  if (stripped.startsWith(GIT_START_PREFIX)) {
+  const prefix = stripped.match(/^(<{3,256})(?= |$)/)?.[0];
+  if (prefix) {
     return {
       kind: "git",
       hash: "",
-      label: splitLabel(stripped.slice(GIT_START_PREFIX.length)),
+      markerSize: prefix.length,
+      label: splitLabel(stripped.slice(prefix.length)),
     };
   }
   return null;
@@ -73,13 +96,19 @@ function matchStartLine(lineText: string): MarkerMatch | null {
 function matchBaseLine(lineText: string): MarkerMatch | null {
   const stripped = stripTrailingCR(lineText);
   if (stripped.startsWith(SB_BASE_PREFIX)) {
-    return { kind: "sb", hash: stripped.slice(SB_BASE_PREFIX.length) };
+    return {
+      kind: "sb",
+      markerSize: 7,
+      hash: stripped.slice(SB_BASE_PREFIX.length),
+    };
   }
-  if (stripped.startsWith(GIT_BASE_PREFIX)) {
+  const prefix = stripped.match(/^(\|{3,256})(?= |$)/)?.[0];
+  if (prefix) {
     return {
       kind: "git",
       hash: "",
-      label: splitLabel(stripped.slice(GIT_BASE_PREFIX.length)),
+      markerSize: prefix.length,
+      label: splitLabel(stripped.slice(prefix.length)),
     };
   }
   return null;
@@ -88,20 +117,26 @@ function matchBaseLine(lineText: string): MarkerMatch | null {
 function matchEndLine(lineText: string): MarkerMatch | null {
   const stripped = stripTrailingCR(lineText);
   if (stripped.startsWith(SB_END_PREFIX)) {
-    return { kind: "sb", hash: stripped.slice(SB_END_PREFIX.length) };
+    return {
+      kind: "sb",
+      markerSize: 7,
+      hash: stripped.slice(SB_END_PREFIX.length),
+    };
   }
-  if (stripped.startsWith(GIT_END_PREFIX)) {
+  const prefix = stripped.match(/^(>{3,256})(?= |$)/)?.[0];
+  if (prefix) {
     return {
       kind: "git",
       hash: "",
-      label: splitLabel(stripped.slice(GIT_END_PREFIX.length)),
+      markerSize: prefix.length,
+      label: splitLabel(stripped.slice(prefix.length)),
     };
   }
   return null;
 }
 
-function matchSeparatorLine(lineText: string): boolean {
-  return stripTrailingCR(lineText) === SEPARATOR_LINE;
+function matchSeparatorLine(lineText: string, size: number): boolean {
+  return stripTrailingCR(lineText) === "=".repeat(size);
 }
 
 function readSection(
@@ -198,7 +233,11 @@ function scanForLine(
   totalLines: number,
   fenceMask: boolean[],
   respectFenceMask: boolean,
-  options: { wantBaseKind?: ConflictKind; wantSeparator?: boolean },
+  options: {
+    wantBaseKind?: ConflictKind;
+    wantSeparator?: boolean;
+    markerSize?: number;
+  },
 ): ScanResult {
   for (let i = from; i <= totalLines; i++) {
     const line = doc.line(i);
@@ -206,12 +245,19 @@ function scanForLine(
       return { kind: "nested", line };
     }
     if (respectFenceMask && fenceMask[i]) continue;
-    if (options.wantSeparator && matchSeparatorLine(line.text)) {
+    if (
+      options.wantSeparator &&
+      matchSeparatorLine(line.text, options.markerSize ?? 7)
+    ) {
       return { kind: "sep", line };
     }
     if (options.wantBaseKind) {
       const base = matchBaseLine(line.text);
-      if (base !== null && base.kind === options.wantBaseKind) {
+      if (
+        base !== null &&
+        base.kind === options.wantBaseKind &&
+        base.markerSize === (options.markerSize ?? 7)
+      ) {
         return { kind: "found", line, match: base };
       }
     }
@@ -226,6 +272,7 @@ function scanForEnd(
   fenceMask: boolean[],
   respectFenceMask: boolean,
   wantKind: ConflictKind,
+  markerSize = 7,
 ):
   | { kind: "found"; line: Line; match: MarkerMatch }
   | { kind: "nested"; line: Line }
@@ -239,7 +286,11 @@ function scanForEnd(
     }
     if (respectFenceMask && fenceMask[i]) continue;
     const end = matchEndLine(line.text);
-    if (end !== null && end.kind === wantKind) {
+    if (
+      end !== null &&
+      end.kind === wantKind &&
+      end.markerSize === markerSize
+    ) {
       return { kind: "found", line, match: end };
     }
   }
@@ -357,6 +408,7 @@ export function findConflictHunks(doc: Text): ConflictHunk[] {
     const baseOrSep = scanForLine(doc, n + 1, totalLines, fenceMask, true, {
       wantBaseKind: "git",
       wantSeparator: true,
+      markerSize: start.markerSize,
     });
     if (baseOrSep.kind === "nested") {
       n = baseOrSep.line.number + 1;
@@ -381,6 +433,7 @@ export function findConflictHunks(doc: Text): ConflictHunk[] {
         true,
         {
           wantSeparator: true,
+          markerSize: start.markerSize,
         },
       );
       if (sepResult.kind === "nested") {
@@ -403,6 +456,7 @@ export function findConflictHunks(doc: Text): ConflictHunk[] {
       fenceMask,
       true,
       "git",
+      start.markerSize,
     );
     if (endResult.kind === "nested") {
       n = endResult.line.number + 1;
@@ -489,11 +543,14 @@ function sectionEq(a: ConflictSection, b: ConflictSection): boolean {
 export function sectionTitle(
   hunk: ConflictHunk,
   role: "first" | "base" | "second",
-  section: ConflictSection,
+  _section: ConflictSection,
 ): string {
-  const label = section.label?.trim();
-  if (hunk.kind === "git" && label) {
-    return label;
+  if (hunk.kind === "git") {
+    return role === "first"
+      ? "This space"
+      : role === "second"
+        ? "Remote repository"
+        : "Common ancestor";
   }
   switch (role) {
     case "first":
@@ -518,6 +575,16 @@ export class ConflictWidget extends WidgetType {
   }
 
   private resolve(action: ConflictResolveAction) {
+    if (this.client.editorView.state.readOnly) return;
+    const current = findConflictHunks(this.client.editorView.state.doc).find(
+      (hunk) => hunk.from === this.hunk.from && hunk.to === this.hunk.to,
+    );
+    if (
+      !current ||
+      !sectionEq(current.first, this.hunk.first) ||
+      !sectionEq(current.second, this.hunk.second)
+    )
+      return;
     const { from, to, insert } = resolveHunk(this.hunk, action);
     this.client.editorView.dispatch({
       changes: { from, to, insert },
@@ -529,6 +596,7 @@ export class ConflictWidget extends WidgetType {
   private editManually() {
     this.client.editorView.dispatch({
       selection: { anchor: this.hunk.from },
+      effects: editConflictManually.of(this.hunk.from),
       annotations: isolateHistory.of("full"),
       scrollIntoView: true,
     });
@@ -543,7 +611,7 @@ export class ConflictWidget extends WidgetType {
     const button = document.createElement("button");
     button.textContent = text;
     button.setAttribute("title", title);
-    button.addEventListener("mouseup", (e) => {
+    button.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
       onClick();
@@ -559,8 +627,11 @@ export class ConflictWidget extends WidgetType {
   ): HTMLElement {
     const wrapper = document.createElement("div");
     wrapper.className = "sb-conflict-section";
-    wrapper.setAttribute("role", "button");
-    wrapper.tabIndex = 0;
+    const readOnly = this.client.editorView.state.readOnly;
+    if (!readOnly) {
+      wrapper.setAttribute("role", "button");
+      wrapper.tabIndex = 0;
+    }
     wrapper.title = section.hash
       ? `${actionTitle} (${shortHash(section.hash)})`
       : `${actionTitle}: ${title}`;
@@ -591,9 +662,9 @@ export class ConflictWidget extends WidgetType {
     const activate = (e: Event) => {
       e.preventDefault();
       e.stopPropagation();
-      this.resolve(action);
+      if (!readOnly) this.resolve(action);
     };
-    wrapper.addEventListener("mouseup", activate);
+    wrapper.addEventListener("click", activate);
     wrapper.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         activate(e);
@@ -611,7 +682,7 @@ export class ConflictWidget extends WidgetType {
     buttonBar.className = "sb-conflict-button-bar";
     buttonBar.appendChild(
       this.createButton(
-        "Accept both",
+        this.hunk.kind === "git" ? "Keep both" : "Accept both",
         "Keep both versions, first then second",
         () => this.resolve("both"),
       ),
@@ -661,7 +732,8 @@ export class ConflictWidget extends WidgetType {
       ),
     );
 
-    container.appendChild(buttonBar);
+    if (!this.client.editorView.state.readOnly)
+      container.appendChild(buttonBar);
     container.appendChild(prompt);
     container.appendChild(sections);
     return container;
@@ -682,16 +754,60 @@ export class ConflictWidget extends WidgetType {
   }
 }
 
-export function conflictMarkers(client: Client) {
-  return decoratorStateField((state: EditorState) => {
-    const hunks = findConflictHunks(state.doc);
-    if (hunks.length === 0) {
-      return Decoration.none;
-    }
+class ManualConflictWidget extends WidgetType {
+  constructor(
+    readonly client: Client,
+    readonly from: number,
+  ) {
+    super();
+  }
 
+  override toDOM(): HTMLElement {
+    const node = document.createElement("div");
+    node.className = "sb-conflict-manual";
+    const text = document.createElement("p");
+    text.textContent =
+      "Remove the conflict markers to resume sync. Your edits are saved automatically.";
+    node.append(text);
+    const button = document.createElement("button");
+    button.textContent = "Show comparison";
+    button.addEventListener("click", () =>
+      this.client.editorView.dispatch({
+        effects: compareConflict.of(this.from),
+      }),
+    );
+    node.append(button);
+    return node;
+  }
+
+  override eq(other: WidgetType): boolean {
+    return other instanceof ManualConflictWidget && other.from === this.from;
+  }
+}
+
+export function conflictMarkers(client: Client) {
+  const decorations = decoratorStateField((state: EditorState) => {
+    const hunks = findConflictHunks(state.doc);
+    const manual = state.field(manualConflicts);
     const widgets: Range<Decoration>[] = [];
+    if (
+      manual.length &&
+      /^(?:<{3,}|>{3,}|\|{3,}|={3,})/m.test(state.doc.toString())
+    ) {
+      for (const from of manual) {
+        widgets.push(
+          Decoration.widget({
+            widget: new ManualConflictWidget(client, from),
+            side: -1,
+          }).range(state.doc.lineAt(from).from),
+        );
+      }
+    }
     for (const hunk of hunks) {
-      if (isCursorInRange(state, [hunk.from, hunk.to])) {
+      if (
+        (hunk.kind === "sb" && isCursorInRange(state, [hunk.from, hunk.to])) ||
+        state.field(manualConflicts).includes(hunk.from)
+      ) {
         continue;
       }
       const hideTo =
@@ -708,4 +824,5 @@ export function conflictMarkers(client: Client) {
 
     return Decoration.set(widgets, true);
   });
+  return [manualConflicts, decorations] as const;
 }

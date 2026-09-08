@@ -1,5 +1,12 @@
+import { base64EncodedDataUrl } from "@silverbulletmd/silverbullet/lib/crypto";
 import { relativeTime } from "@silverbulletmd/silverbullet/lib/dates";
-import type { FileStatus } from "@silverbulletmd/silverbullet/type/revisions";
+import type { Path } from "@silverbulletmd/silverbullet/lib/ref";
+import type {
+  FileStatus,
+  GitConflict,
+  GitConflictAction,
+  SyncState,
+} from "@silverbulletmd/silverbullet/type/revisions";
 import {
   editor,
   events,
@@ -20,6 +27,9 @@ import {
   type SourceCtx,
 } from "./types.ts";
 
+import { loadGitSyncStatus } from "../../git_sync_status.ts";
+import { syncStatusText } from "../../sync_notification.ts";
+
 const STATUS_ICONS: Record<FileStatus, string> = {
   added: "file-plus",
   modified: "file-text",
@@ -33,6 +43,27 @@ const MORE = "@more";
 
 const OFFLINE = "Revision history unavailable — offline.";
 const DISABLED = "Revision history is off for this space.";
+
+export const SYNC_CONFLICT = (n: number) =>
+  `Sync paused — ${n} ${n === 1 ? "page has" : "pages have"} conflicting changes.`;
+export const SYNC_ERROR = "Sync failed — check the space's git settings.";
+export const SYNC_PAUSED = (reason: string) => `Sync paused — ${reason}.`;
+
+/** Row name for the synthetic sync-status header; never a real commit rev. */
+const SYNC_HEADER = "@sync";
+
+function syncHeaderText(sync: SyncState): string | undefined {
+  switch (sync.state) {
+    case "conflicted":
+      return SYNC_CONFLICT(sync.paths.length);
+    case "paused":
+      return SYNC_PAUSED(sync.reason);
+    case "error":
+      return SYNC_ERROR;
+    default:
+      return undefined;
+  }
+}
 
 type Accumulator<T> = {
   key: string;
@@ -373,7 +404,47 @@ type LogRow = {
   timestamp?: number;
   added?: number;
   removed?: number;
+  /** Set only on the synthetic sync-status rows this view prepends -- never
+   * on a real commit or file row. */
+  sync?: "header" | "path";
+  syncEnabled?: boolean;
+  syncConflicts?: boolean;
 };
+
+/** The non-selectable banner (and, for a conflict, its per-path links) shown
+ * above the commit list -- see `syncHeaderText`. Empty once idle.
+ *
+ * A conflict set is one to three files, not the dozens a commit's file list
+ * is designed for, so every path row's `name` is flat (no `/` at all, not
+ * even a shared `${SYNC_HEADER}/` prefix) -- unlike a commit's files, they
+ * must never nest under the header as children hidden behind an expand
+ * click. The header carries the one-glance alarm; hiding which pages are
+ * affected behind an extra click would make it less useful, not tidier. */
+function syncRows(sync: SyncState | null | undefined): LogRow[] {
+  if (!sync) return [];
+  const text = syncHeaderText(sync);
+  if (!text) return [];
+  const rows: LogRow[] = [
+    {
+      name: SYNC_HEADER,
+      rev: SYNC_HEADER,
+      message: text,
+      sync: "header",
+      syncConflicts: sync.state === "conflicted",
+    },
+  ];
+  if (sync.state === "conflicted") {
+    for (const path of sync.paths) {
+      rows.push({
+        name: `${SYNC_HEADER}${PATH_SLASH}${path.replaceAll("/", PATH_SLASH)}`,
+        rev: SYNC_HEADER,
+        file: path,
+        sync: "path",
+      });
+    }
+  }
+  return rows;
+}
 
 let logAcc: Accumulator<LogRow> | undefined;
 
@@ -389,6 +460,19 @@ async function fetchSpaceLogPage(
   }
   if (log.mode === "disabled") throw new Error(DISABLED);
   const rows: LogRow[] = [];
+  // The sync banner and, for a conflict, its per-path rows describe the
+  // sync state right now, not this page of history -- only the first page
+  // shows them.
+  if (before === undefined) {
+    const status = await loadGitSyncStatus();
+    if (status.snapshot || status.stale) {
+      rows.push(gitStatusRow(status));
+      if (status.snapshot?.sync.state === "conflicted")
+        rows.push(...syncRows(status.snapshot.sync).slice(1));
+    } else {
+      rows.push(...syncRows(log.sync));
+    }
+  }
   // A pseudo-commit for what is not committed yet, expanding to the files it
   // covers exactly as a real commit row does. It describes the working tree
   // right now, not this page of history -- only the first page shows it.
@@ -473,6 +557,7 @@ async function loadMoreSpaceLog(): Promise<boolean> {
 }
 
 function logRowLabel(obj: LogRow): string {
+  if (obj.sync === "header") return obj.message ?? "";
   if (obj.name === MORE) return "Load more…";
   if (obj.file) return obj.file;
   if (obj.rev === UNCOMMITTED) return "Uncommitted changes";
@@ -519,17 +604,27 @@ export const spaceLogView: BuiltinView<LogRow> = {
       return chips.length > 0 ? chips : undefined;
     },
     icon: (obj) =>
-      obj.name === MORE
-        ? "chevron-down"
-        : obj.file
-          ? STATUS_ICONS[obj.status ?? "modified"]
-          : obj.rev === UNCOMMITTED
-            ? "edit-3"
-            : "git-commit",
+      obj.sync === "header"
+        ? "alert-triangle"
+        : obj.name === MORE
+          ? "chevron-down"
+          : obj.file
+            ? STATUS_ICONS[obj.status ?? "modified"]
+            : obj.rev === UNCOMMITTED
+              ? "edit-3"
+              : "git-commit",
     cssClass: () => "sb-nav-noband",
   },
   source: spaceLogRows,
   onSelect: (obj) => {
+    // The banner row is purely informational -- unlike a commit row, its
+    // paths are flat siblings, not children behind an expand click, so
+    // there is nothing for selecting it to do. A conflicted path is a link
+    // straight to the page, not a preview: there is no commit to diff.
+    if (obj.sync === "header") return Promise.resolve(false);
+    if (obj.sync === "path") {
+      return editor.navigate({ path: obj.file as Path }).then(() => false);
+    }
     if (obj.name === MORE) {
       return loadMoreSpaceLog().then(async (didLoad) => {
         if (didLoad) await events.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
@@ -542,15 +637,238 @@ export const spaceLogView: BuiltinView<LogRow> = {
     return previewLogFile(obj, true);
   },
   keymap: {
-    " ": (obj) => (obj.name === MORE ? false : previewLogFile(obj, false)),
+    " ": (obj) =>
+      obj.sync || obj.name === MORE ? false : previewLogFile(obj, false),
   },
   actions: [
     {
       icon: "rotate-ccw",
       label: "Restore",
       requireMode: "rw",
-      when: (obj) => !!obj.file?.endsWith(".md") && obj.rev !== UNCOMMITTED,
+      when: (obj) =>
+        !obj.sync && !!obj.file?.endsWith(".md") && obj.rev !== UNCOMMITTED,
       run: (obj) => restoreRevision({ ...obj, page: obj.file! }),
+    },
+    {
+      icon: "refresh-cw",
+      label: "Sync now",
+      requireMode: "rw",
+      when: (obj) => obj.sync === "header" && obj.syncEnabled === true,
+      run: requestGitSync,
+    },
+
+    {
+      icon: "alert-triangle",
+      label: "Review conflicts",
+      when: (obj) => obj.sync === "header" && obj.syncConflicts === true,
+      run: async () =>
+        (await import("../navigator.ts")).openView("std.gitConflicts"),
+    },
+  ],
+};
+
+function gitStatusRow(
+  status: Awaited<ReturnType<typeof loadGitSyncStatus>>,
+): LogRow {
+  const previous = status.snapshot?.lastSuccess;
+  return {
+    name: SYNC_HEADER,
+    rev: SYNC_HEADER,
+    sync: "header",
+    syncEnabled: status.snapshot?.enabled && !status.snapshot.paused,
+    syncConflicts: status.snapshot?.sync.state === "conflicted",
+    message: status.stale
+      ? `Git status unavailable${previous ? ` · Last successful sync ${new Date(previous).toLocaleString()}` : ""}`
+      : status.snapshot
+        ? syncStatusText(status.snapshot)
+        : "Git sync is not available for this space.",
+  };
+}
+
+export const gitStatusView: BuiltinView<LogRow> = {
+  meta: baseMeta({
+    title: "Git status",
+    mode: "list",
+    dock: DOCK,
+    noFilter: true,
+    refreshOn: [REVISIONS_CHANGED_EVENT],
+    refreshOnOpen: true,
+  }),
+  row: {
+    primary: (row) => row.message ?? "Git status",
+    icon: () => "git-branch",
+  },
+  source: async () => [gitStatusRow(await loadGitSyncStatus())],
+  onSelect: async () => false,
+  actions: spaceLogView.actions!.filter((action) => action.label !== "Restore"),
+};
+
+export async function requestGitSync(): Promise<void> {
+  if (await isReadOnly()) return;
+  try {
+    await editor.save();
+    await space.syncGitNow();
+    await editor.flashNotification("Git sync requested");
+  } catch (error: any) {
+    await editor.flashNotification(
+      error?.status === 403
+        ? "Only writers can request Git sync."
+        : error?.status === 404
+          ? "Git sync is not available for this space."
+          : "Could not sync. Review Git status; an administrator may need to repair the connection.",
+      "error",
+    );
+  }
+  await events.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
+}
+
+type ConflictRow = GitConflict & { name: string; generation: string };
+
+function canResolve(row: GitConflict): boolean {
+  return row.canResolve ?? row.kind !== "unsupported";
+}
+
+async function resolveConflict(
+  row: ConflictRow,
+  action: GitConflictAction,
+): Promise<void> {
+  if (await isReadOnly()) return;
+  if (
+    action === "delete" &&
+    !(await editor.confirm(`Delete ${row.path} to resolve this conflict?`))
+  )
+    return;
+  try {
+    await editor.save();
+    const result = await space.resolveGitConflict(
+      row.id,
+      row.generation,
+      row.contentRevision,
+      action,
+    );
+    await editor.flashNotification(
+      result.conflicts.length
+        ? `${row.path} resolved`
+        : "All conflicts resolved. Resuming sync…",
+    );
+  } catch (error: any) {
+    await editor.flashNotification(
+      error?.status === 409 || error?.status === 428
+        ? "This conflict changed. Review the refreshed file before choosing again."
+        : "Could not resolve this conflict. Refresh and review the file before retrying.",
+      "error",
+    );
+  }
+  await events.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
+}
+
+async function downloadConflict(
+  row: ConflictRow,
+  side: "local" | "remote",
+): Promise<void> {
+  try {
+    const content = await space.getGitConflictVersion(
+      row.id,
+      row.generation,
+      side,
+    );
+    await editor.downloadFile(
+      `${row.path.split("/").at(-1)}.${side}`,
+      base64EncodedDataUrl("application/octet-stream", content),
+    );
+  } catch {
+    await editor.flashNotification(
+      "Could not download this version. Refresh the conflict list and try again.",
+      "error",
+    );
+    await events.dispatchEvent(REVISIONS_CHANGED_EVENT, {});
+  }
+}
+
+export const gitConflictsView: BuiltinView<ConflictRow> = {
+  meta: baseMeta({
+    title: "Git conflicts",
+    emptyText:
+      "No unresolved Git conflicts. Open Git status for sync progress.",
+    dock: DOCK,
+    mode: "list",
+    noFilter: true,
+    limit: 10000,
+    refreshOn: ["file:changed", "file:deleted", REVISIONS_CHANGED_EVENT],
+    refreshOnOpen: true,
+  }),
+  row: {
+    primary: (row) => row.path,
+    description: (row) =>
+      row.kind === "text"
+        ? "Edit the markers away to resume automatically"
+        : row.kind === "deleteModify"
+          ? "Deleted on one side; choose a version or deletion"
+          : row.kind === "binary"
+            ? "Binary file; choose which version to keep"
+            : canResolve(row)
+              ? "Choose a version, or save and keep an edited version"
+              : "Unsupported file; resolve with Git on the server",
+    icon: () => "alert-triangle",
+  },
+  source: async () => {
+    const result = await space.getGitConflicts();
+    return result.conflicts.map((conflict) => ({
+      ...conflict,
+      name: conflict.id,
+      generation: result.generation,
+    }));
+  },
+  onSelect: async (row) => {
+    if (row.kind === "text") await editor.navigate({ path: row.path as Path });
+    else
+      await editor.flashNotification(
+        !canResolve(row)
+          ? "An administrator must resolve this file with Git on the server."
+          : "Use this file's actions to keep This space, keep Remote repository, or keep the deletion.",
+      );
+    return false;
+  },
+  actions: [
+    {
+      icon: "check",
+      label: "Keep This space",
+      requireMode: "rw",
+      when: (row) => canResolve(row) && row.local,
+      run: (row) => resolveConflict(row, "local"),
+    },
+    {
+      icon: "download",
+      label: "Keep Remote repository",
+      requireMode: "rw",
+      when: (row) => canResolve(row) && row.remote,
+      run: (row) => resolveConflict(row, "remote"),
+    },
+    {
+      icon: "trash",
+      label: "Keep deletion",
+      requireMode: "rw",
+      when: (row) => canResolve(row) && row.kind === "deleteModify",
+      run: (row) => resolveConflict(row, "delete"),
+    },
+    {
+      icon: "edit-3",
+      label: "Keep edited version",
+      requireMode: "rw",
+      when: (row) => canResolve(row) && row.contentRevision !== "missing",
+      run: (row) => resolveConflict(row, "edited"),
+    },
+    {
+      icon: "download",
+      label: "Download This space",
+      when: (row) => row.local,
+      run: (row) => downloadConflict(row, "local"),
+    },
+    {
+      icon: "download",
+      label: "Download Remote repository",
+      when: (row) => row.remote,
+      run: (row) => downloadConflict(row, "remote"),
     },
   ],
 };

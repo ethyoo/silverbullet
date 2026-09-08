@@ -1257,3 +1257,11 @@ test("typing a new search resets the space-log accumulator", async () => {
   expect(rows).toHaveLength(1);
   expect(space.getSpaceLog).toHaveBeenLastCalledWith(undefined, "bar");
 });
+
+test("read members retain Git views while revision history stays hidden", () => {
+  setRevisionsAvailable(false, true);
+  expect(builtinMeta("std.pageHistory")).toBeUndefined();
+  expect(builtinMeta("std.spaceLog")).toBeUndefined();
+  expect(builtinMeta("std.gitStatus")?.title).toBe("Git status");
+  expect(builtinMeta("std.gitConflicts")?.title).toBe("Git conflicts");
+});

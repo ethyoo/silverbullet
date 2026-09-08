@@ -201,16 +201,16 @@ class FakeEventSource {
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
-  listeners = new Map<string, () => void>();
+  listeners = new Map<string, (ev?: { data: string }) => void>();
 
   constructor(public url: string) {}
 
-  addEventListener(type: string, fn: () => void) {
+  addEventListener(type: string, fn: (ev?: { data: string }) => void) {
     this.listeners.set(type, fn);
   }
 
-  emit(type: string) {
-    this.listeners.get(type)?.();
+  emit(type: string, data?: string) {
+    this.listeners.get(type)?.(data !== undefined ? { data } : undefined);
   }
 
   close() {
@@ -371,6 +371,56 @@ describe("RealtimeEvents connection lifecycle", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     instances[0].emit("ping");
     expect(hooks.notifyStatus).toHaveBeenCalledTimes(2);
+    rt.stop();
+  });
+
+  it("delivers a sync event's parsed state to every onSyncState listener", async () => {
+    const rt = new RealtimeEvents(hooks);
+    const first = vi.fn();
+    const second = vi.fn();
+    rt.onSyncState(first);
+    rt.onSyncState(second);
+    rt.start("http://localhost/.events");
+    instances[0].onopen?.();
+
+    instances[0].emit(
+      "sync",
+      JSON.stringify({ state: "conflicted", paths: ["a.md"] }),
+    );
+
+    expect(first).toHaveBeenCalledWith({
+      state: "conflicted",
+      paths: ["a.md"],
+    });
+    expect(second).toHaveBeenCalledWith({
+      state: "conflicted",
+      paths: ["a.md"],
+    });
+    rt.stop();
+  });
+
+  it("a sync event also counts as a heartbeat", async () => {
+    const rt = new RealtimeEvents(hooks);
+    rt.start("http://localhost/.events");
+    instances[0].onopen?.();
+    expect(hooks.notifyStatus).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    instances[0].emit("sync", JSON.stringify({ state: "idle" }));
+    expect(hooks.notifyStatus).toHaveBeenCalledTimes(2);
+    expect(hooks.notifyStatus).toHaveBeenLastCalledWith(true);
+    rt.stop();
+  });
+
+  it("a malformed sync payload is dropped without throwing or notifying listeners", async () => {
+    const rt = new RealtimeEvents(hooks);
+    const listener = vi.fn();
+    rt.onSyncState(listener);
+    rt.start("http://localhost/.events");
+    instances[0].onopen?.();
+
+    expect(() => instances[0].emit("sync", "{not json")).not.toThrow();
+    expect(listener).not.toHaveBeenCalled();
     rt.stop();
   });
 

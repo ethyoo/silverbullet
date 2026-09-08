@@ -905,6 +905,14 @@ $comment-border: 1px;
     border-radius: 0;
   }
 
+  .sb-conflict-manual {
+    display: block;
+    white-space: normal;
+    padding: 6px 8px;
+    background-color: var(--alert-warning-background-color);
+    font-size: 0.85em;
+  }
+
   .sb-conflict-widget {
     display: block;
     margin: 10px 0;

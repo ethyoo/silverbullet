@@ -17,6 +17,9 @@ import type {
 } from "@silverbulletmd/silverbullet/type/index";
 import type {
   FileRevisions,
+  GitSyncSnapshot,
+  GitConflicts,
+  GitConflictAction,
   SpaceLog,
 } from "@silverbulletmd/silverbullet/type/revisions";
 import type { Client } from "../../client.ts";
@@ -30,10 +33,18 @@ function revisionsUrl(client: Client, suffix: string): string {
 async function fetchRevisionsJson(
   client: Client,
   suffix: string,
+  body?: unknown,
 ): Promise<any> {
   const resp = await client.httpSpacePrimitives.authenticatedFetch(
     revisionsUrl(client, suffix),
-    { method: "GET", headers: { Accept: "application/json" } },
+    {
+      method: body === undefined ? "GET" : "POST",
+      headers: {
+        Accept: "application/json",
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
   );
   if (resp.status === 404) {
     throw Object.assign(
@@ -67,6 +78,43 @@ async function resolutionIndex(client: Client): Promise<BasenameIndex> {
 
 export function spaceReadSyscalls(client: Client): SysCallMapping {
   return {
+    "space.getGitSyncStatus": {
+      callback: (): Promise<GitSyncSnapshot> =>
+        fetchRevisionsJson(client, "_sync"),
+      description: "Reads Git sync status and its last successful check.",
+    },
+    "space.getGitConflictVersion": {
+      callback: async (
+        _ctx,
+        id: string,
+        generation: string,
+        side: "local" | "remote",
+      ): Promise<Uint8Array> => {
+        if (side !== "local" && side !== "remote")
+          throw new Error("Unknown conflict side");
+        const response = await client.httpSpacePrimitives.authenticatedFetch(
+          revisionsUrl(
+            client,
+            `_conflicts/${encodeURIComponent(id)}/${side}?generation=${encodeURIComponent(generation)}`,
+          ),
+          { method: "GET" },
+        );
+        if (!response.ok)
+          throw Object.assign(
+            new Error("Could not read this conflict version"),
+            { status: response.status },
+          );
+        return new Uint8Array(await response.arrayBuffer());
+      },
+      description: "Downloads one original side of an unresolved Git conflict.",
+      signatures: ["space.getGitConflictVersion(id, generation, side)"],
+    },
+    "space.getGitConflicts": {
+      callback: (): Promise<GitConflicts> =>
+        fetchRevisionsJson(client, "_conflicts"),
+      description:
+        "Lists unresolved Git conflicts with saved content versions.",
+    },
     "space.listPages": {
       callback: (): Promise<PageMeta[]> => client.space.fetchPageList(),
       description: "Lists all pages in the space.",
@@ -306,6 +354,29 @@ export function spaceReadSyscalls(client: Client): SysCallMapping {
 
 export function spaceWriteSyscalls(editor: Client): SysCallMapping {
   return {
+    "space.syncGitNow": {
+      callback: () => fetchRevisionsJson(editor, "_sync", {}),
+      description: "Requests sync on the existing Git connection.",
+    },
+    "space.resolveGitConflict": {
+      callback: (
+        _ctx,
+        id: string,
+        generation: string,
+        contentRevision: string,
+        action: GitConflictAction,
+      ): Promise<GitConflicts> =>
+        fetchRevisionsJson(editor, `_conflicts/${encodeURIComponent(id)}`, {
+          generation,
+          contentRevision,
+          action,
+        }),
+      description:
+        "Resolves a Git conflict if the merge and saved content still match.",
+      signatures: [
+        "space.resolveGitConflict(id, generation, contentRevision, action)",
+      ],
+    },
     "space.writePage": {
       callback: (_ctx, name: string, text: string): Promise<PageMeta> =>
         editor.space.writePage(name, text),

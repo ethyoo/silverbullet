@@ -52,6 +52,9 @@ async function waitForEditor(page: Page): Promise<void> {
   await page
     .locator("#sb-editor .cm-editor")
     .waitFor({ state: "visible", timeout: 30_000 });
+  await expect
+    .poll(() => page.evaluate(() => !!(globalThis as any).client?.systemReady))
+    .toBe(true);
 }
 
 async function readFullIndexCompleted(
@@ -204,6 +207,33 @@ test.describe("index version upgrade (service worker disabled)", () => {
     await waitForIndexVersionAtLeast(page, baseline as number);
     expect(await readIndexVersion(page)).toBe(baseline);
   });
+});
+
+test("a sync completion received during client initialization survives boot", async ({
+  sbServer,
+  page,
+}) => {
+  await page.addInitScript(() => {
+    let client: any;
+    Object.defineProperty(globalThis, "client", {
+      configurable: true,
+      get: () => client,
+      set: (value) => {
+        client = value;
+        navigator.serviceWorker.dispatchEvent(
+          new MessageEvent("message", {
+            data: { type: "space-sync-complete", operations: 0 },
+          }),
+        );
+      },
+    });
+  });
+  await gotoSilverBulletPage(page, sbServer);
+  await expect
+    .poll(() =>
+      page.evaluate(() => (globalThis as any).client.fullSyncCompleted),
+    )
+    .toBe(true);
 });
 
 test.describe("index version upgrade (service worker enabled)", () => {

@@ -79,6 +79,7 @@ export type ViewMeta = {
   /** `filter = false`: no phrase filtering; the input is hidden but stays the
    * panel's focus home so the keyboard pipeline keeps working. */
   noFilter?: boolean;
+  emptyText?: string;
   followEditor: boolean;
   refreshOn: string[];
   hasMove: boolean;

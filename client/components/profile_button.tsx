@@ -62,56 +62,59 @@ export function profileMenuHeader(profile: ProfileState): {
     : { title: profile.username };
 }
 
+export type ProfileMenuActions = {
+  editProfile: () => void;
+  allSpaces: () => void;
+  logIn: () => void;
+  logOut: () => void;
+};
+
 export function profileMenuItems(
+  profile: ProfileState,
+  actions: ProfileMenuActions,
+): MenuItem[] {
+  if (profile.status !== "signed-in") {
+    return [{ name: "Log in", run: actions.logIn }];
+  }
+  return [
+    { name: "Edit profile", run: actions.editProfile },
+    { name: "All spaces", run: actions.allSpaces },
+    { name: "Log out", run: actions.logOut },
+  ];
+}
+
+export function editorProfileMenuItems(
   profile: ProfileState,
   client: Client,
 ): MenuItem[] {
-  if (profile.status !== "signed-in") {
-    return [
-      {
-        name: "Log in",
-        run: () => {
-          location.href = `.auth?from=${encodeURIComponent(location.pathname)}`;
-        },
-      },
-    ];
-  }
-  return [
-    {
-      name: "Edit profile",
-      run: () => {
-        client.openUrl("/.spaces/profile");
-      },
+  return profileMenuItems(profile, {
+    logIn: () => {
+      location.href = `.auth?from=${encodeURIComponent(location.pathname)}`;
     },
-    {
-      name: "All spaces",
-      run: () => {
-        location.href = "/.spaces";
-      },
+    editProfile: () => client.openUrl("/.spaces/profile"),
+    allSpaces: () => {
+      location.href = "/.spaces";
     },
-    {
-      name: "Log out",
-      run: () => {
-        void (async () => {
-          let response: Response;
-          try {
-            response = await fetch(LOGOUT_URL);
-          } catch {
-            client.ui.flashNotification("Could not log out", "error");
-            return;
-          }
-          if (!response.ok) {
-            client.ui.flashNotification("Could not log out", "error");
-            return;
-          }
-          try {
-            await client.wipeClient();
-          } catch (e: any) {
-            console.error("Wiping local data after logout failed", e);
-          }
-          location.href = ".auth";
-        })();
-      },
+    logOut: () => {
+      void (async () => {
+        let response: Response;
+        try {
+          response = await fetch(LOGOUT_URL);
+        } catch {
+          client.ui.flashNotification("Could not log out", "error");
+          return;
+        }
+        if (!response.ok) {
+          client.ui.flashNotification("Could not log out", "error");
+          return;
+        }
+        try {
+          await client.wipeClient();
+        } catch (e: any) {
+          console.error("Wiping local data after logout failed", e);
+        }
+        location.href = ".auth";
+      })();
     },
-  ];
+  });
 }

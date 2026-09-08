@@ -6,12 +6,13 @@ import {
 } from "@silverbulletmd/silverbullet/syscalls";
 import type { CommandHook } from "../plugos/hooks/command.ts";
 import { openCommand } from "./navigator.ts";
-import { REVISIONS_CHANGED_EVENT } from "./views/revisions.ts";
+import { REVISIONS_CHANGED_EVENT, requestGitSync } from "./views/revisions.ts";
 
 /** The built-in navigator views that come with a command of their own. */
 export function registerNavigatorCommands(
   hook: CommandHook,
   revisionsEnabled: boolean,
+  gitAvailable = revisionsEnabled,
 ): void {
   hook.registerCommand({
     name: "Navigate: Tree",
@@ -20,7 +21,22 @@ export function registerNavigatorCommands(
     menu: { location: "view", group: "1_views", order: 4, label: "Tree" },
     run: openCommand("std.spaceTree"),
   });
+  if (gitAvailable) {
+    hook.registerCommand({
+      name: "Git: View status",
+      run: openCommand("std.gitStatus"),
+    });
+    hook.registerCommand({
+      name: "Git: Review conflicts",
+      run: openCommand("std.gitConflicts"),
+    });
+  }
   if (revisionsEnabled) {
+    hook.registerCommand({
+      name: "Git: Sync now",
+      requireMode: "rw",
+      run: requestGitSync,
+    });
     hook.registerCommand({
       name: "Revision: Page History",
       requireEditor: "page",

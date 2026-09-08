@@ -72,6 +72,13 @@ if (!crypto.subtle) {
 }
 
 safeRun(async () => {
+  const clientReady = Promise.withResolvers<Client>();
+  navigator.serviceWorker?.addEventListener("message", (event) => {
+    // Sync can finish while init is still loading the index and plugins.
+    void clientReady.promise.then((client) =>
+      client.handleServiceWorkerMessage(event.data),
+    );
+  });
   performance.mark("sb:boot-start");
   // First we attempt to fetch the config from the server
   let bootConfig: BootConfig | undefined;
@@ -169,6 +176,8 @@ safeRun(async () => {
   await augmentBootConfig(bootConfig!, config!);
 
   const isHeadless = new URLSearchParams(location.search).has("headless");
+  const reviewGitConflicts =
+    new URLSearchParams(location.search).get("gitConflicts") === "1";
   // Expose headless flag on the runtime bridge so client.init() can detect
   // it after URL params are stripped.
   if (isHeadless) {
@@ -287,11 +296,8 @@ safeRun(async () => {
   globalThis.client = client;
   clientProxy.setTarget(client);
   await client.init(encryptionKey);
-  if (navigator.serviceWorker) {
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      void client.handleServiceWorkerMessage(event.data);
-    });
-  }
+  clientReady.resolve(client);
+  if (reviewGitConflicts) await client.openNavigatorView("std.gitConflicts");
 });
 
 /**

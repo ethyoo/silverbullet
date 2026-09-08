@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import { EditorState, Text } from "@codemirror/state";
 import { describe, expect, test } from "vitest";
 import type { Client } from "../client.ts";
@@ -570,7 +571,7 @@ describe("conflictMarkers extension (smoke)", () => {
     expect(() => {
       state = EditorState.create({ doc, extensions: [field] });
     }).not.toThrow();
-    return state!.field(field);
+    return state!.field(field[1]);
   }
 
   test("builds for a mid-document hunk followed by more content", () => {
@@ -781,26 +782,26 @@ describe("sectionTitle", () => {
     };
   }
 
-  test("uses the git label as the title when present", () => {
+  test("Git sides have human labels independent of branch names", () => {
     const hunk = gitHunk();
-    expect(sectionTitle(hunk, "first", hunk.first)).toBe("HEAD");
-    expect(sectionTitle(hunk, "second", hunk.second)).toBe("feature");
+    expect(sectionTitle(hunk, "first", hunk.first)).toBe("This space");
+    expect(sectionTitle(hunk, "second", hunk.second)).toBe("Remote repository");
   });
 
-  test("falls back to positional titles for a git hunk with no labels", () => {
+  test("Git sides keep their meaning without marker labels", () => {
     const hunk = gitHunk({
       first: { from: 0, to: 1, hash: "", label: "", text: "mine\n" },
       second: { from: 2, to: 3, hash: "", label: "", text: "theirs\n" },
     });
-    expect(sectionTitle(hunk, "first", hunk.first)).toBe("Version 1");
-    expect(sectionTitle(hunk, "second", hunk.second)).toBe("Version 2");
+    expect(sectionTitle(hunk, "first", hunk.first)).toBe("This space");
+    expect(sectionTitle(hunk, "second", hunk.second)).toBe("Remote repository");
   });
 
-  test("falls back to positional titles for a whitespace-only label", () => {
+  test("Git labels do not depend on whitespace in marker labels", () => {
     const hunk = gitHunk({
       first: { from: 0, to: 1, hash: "", label: "   ", text: "mine\n" },
     });
-    expect(sectionTitle(hunk, "first", hunk.first)).toBe("Version 1");
+    expect(sectionTitle(hunk, "first", hunk.first)).toBe("This space");
   });
 
   test("always uses positional titles for SB hunks, ignoring any label", () => {
@@ -844,68 +845,36 @@ describe("shouldRenderBasePanel", () => {
   });
 });
 
-// This repo has no jsdom/happy-dom dependency, so ConflictWidget.toDOM()
-// can't actually run here — the logic it renders (title text, truncation,
-// base-panel gating) is pinned without a DOM by the pure-function
-// describes above instead; these are left in, skipped, as the intended
-// assertions for whenever a DOM environment becomes available.
-describe.skip("ConflictWidget DOM — git labels as panel titles (needs jsdom, unavailable in this repo)", () => {
-  const stubClient = {} as unknown as Client;
+test("Git conflict controls render with the caret on the first line", () => {
+  const field = conflictMarkers({} as Client);
+  const state = EditorState.create({
+    doc: "<<<<<<< HEAD\nLocal\n=======\nRemote\n>>>>>>> origin/main\n",
+    extensions: field,
+  });
+  const decorations = state.facet(EditorView.decorations);
+  expect(
+    decorations.some((set) => typeof set !== "function" && set.size > 0),
+  ).toBe(true);
+});
 
-  test("uses the git label as the panel title, truncated with a tooltip", () => {
-    const longLabel =
-      "a-really-long-feature-branch-name-that-should-be-truncated";
-    const hunk: ConflictHunk = {
-      from: 0,
-      to: 10,
-      kind: "git",
-      first: { from: 0, to: 1, hash: "", label: "HEAD", text: "mine\n" },
-      second: {
-        from: 2,
-        to: 3,
-        hash: "",
-        label: longLabel,
-        text: "theirs\n",
-      },
-    };
-    const widget = new ConflictWidget(hunk, stubClient);
-    const dom = widget.toDOM();
-
-    const headers = dom.querySelectorAll(".sb-conflict-section-header");
-    expect(headers).toHaveLength(2);
-    expect(headers[0].textContent).toBe("HEAD");
-    expect(headers[1].textContent).toBe(`${longLabel.slice(0, 24)}…`);
-
-    const panels = dom.querySelectorAll(".sb-conflict-section");
-    expect(panels[1].getAttribute("title")).toContain(longLabel);
-    expect(panels[1].getAttribute("aria-label")).toBe(`Accept ${longLabel}`);
+describe("Git conflict marker sizes", () => {
+  test.each([
+    3, 9, 32,
+  ])("resolves a diff3 hunk with %i-character markers", (size) => {
+    const source = `${"<".repeat(size)} HEAD\nlocal\n${"|".repeat(size)} base\nbase\n${"=".repeat(size)}\nremote\n${">".repeat(size)} incoming\n`;
+    const hunks = findConflictHunks(docOf(source));
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0].first.text).toBe("local\n");
+    expect(hunks[0].base?.text).toBe("base\n");
+    expect(hunks[0].second.text).toBe("remote\n");
+    expect(hunks[0].first.label).toBe("HEAD");
   });
 
-  test("falls back to positional titles when a git hunk has no labels", () => {
-    const hunk: ConflictHunk = {
-      from: 0,
-      to: 10,
-      kind: "git",
-      first: { from: 0, to: 1, hash: "", label: "", text: "mine\n" },
-      second: { from: 2, to: 3, hash: "", label: "", text: "theirs\n" },
-    };
-    const widget = new ConflictWidget(hunk, stubClient);
-    const dom = widget.toDOM();
-
-    const headers = dom.querySelectorAll(".sb-conflict-section-header");
-    expect(headers[0].textContent).toBe("Version 1");
-    expect(headers[1].textContent).toBe("Version 2");
-  });
-
-  test("only renders a base panel when the hunk has one", () => {
-    const withoutBase: ConflictHunk = {
-      from: 0,
-      to: 10,
-      kind: "git",
-      first: { from: 0, to: 1, hash: "", label: "HEAD", text: "mine\n" },
-      second: { from: 2, to: 3, hash: "", label: "feature", text: "theirs\n" },
-    };
-    const dom = new ConflictWidget(withoutBase, stubClient).toDOM();
-    expect(dom.querySelectorAll(".sb-conflict-section")).toHaveLength(2);
+  test("does not accept mismatched marker widths", () => {
+    expect(
+      findConflictHunks(
+        docOf("<<<<<<<<< HEAD\nlocal\n=======\nremote\n>>>>>>>>> incoming\n"),
+      ),
+    ).toHaveLength(0);
   });
 });

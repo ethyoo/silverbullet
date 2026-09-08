@@ -10,6 +10,7 @@ export function ListView({
   rows,
   selectedIndex,
   showEmpty,
+  emptyText,
   actions,
   actionIcons,
   rowState,
@@ -24,6 +25,7 @@ export function ListView({
   rows: (RankedRow | undefined)[];
   selectedIndex: number;
   showEmpty: boolean;
+  emptyText?: string;
   actions?: ActionMeta[];
   actionIcons?: (Element | undefined)[];
   rowState?: RowStates;
@@ -66,7 +68,9 @@ export function ListView({
   }, [rows, selectedIndex, hover]);
 
   if (rows.length === 0) {
-    return showEmpty ? <div className="sb-nav-empty">No results</div> : null;
+    return showEmpty ? (
+      <div className="sb-nav-empty">{emptyText ?? "No results"}</div>
+    ) : null;
   }
 
   return (

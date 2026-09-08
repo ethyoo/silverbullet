@@ -178,7 +178,10 @@ test("a resize tick after a real close stays dropped", async () => {
   expect(slots.showSlot).not.toHaveBeenCalled();
 });
 
-async function registeredCommands(revisionsEnabled = true) {
+async function registeredCommands(
+  revisionsEnabled = true,
+  gitAvailable = revisionsEnabled,
+) {
   await freshNavigator();
   const { registerNavigatorCommands } = await import("./commands.ts");
   const commands = new Map<string, any>();
@@ -187,6 +190,7 @@ async function registeredCommands(revisionsEnabled = true) {
       registerCommand: (command: any) => commands.set(command.name, command),
     } as any,
     revisionsEnabled,
+    gitAvailable,
   );
   return commands;
 }
@@ -497,4 +501,12 @@ test("only views the space configured open reach boot restore", async () => {
 
   const shown = slots.showSlot.mock.calls.map((call: any[]) => call[2].view);
   expect(shown).toEqual(["a"]);
+});
+
+test("read members get Git status and conflict commands without history", async () => {
+  const commands = await registeredCommands(false, true);
+  expect(commands.has("Git: View status")).toBe(true);
+  expect(commands.has("Git: Review conflicts")).toBe(true);
+  expect(commands.has("Revision: Space History")).toBe(false);
+  expect(commands.has("Git: Sync now")).toBe(false);
 });
