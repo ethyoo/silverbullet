@@ -6,6 +6,16 @@ use std::sync::Mutex;
 const COMMITTER_NAME: &str = "SilverBullet";
 const COMMITTER_EMAIL: &str = "silverbullet@silverbullet.local";
 
+pub(super) fn commit_env<'a>(author: Option<(&'a str, &'a str)>) -> [(&'static str, &'a str); 4] {
+    let (name, email) = author.unwrap_or((COMMITTER_NAME, COMMITTER_EMAIL));
+    [
+        ("GIT_AUTHOR_NAME", name),
+        ("GIT_AUTHOR_EMAIL", email),
+        ("GIT_COMMITTER_NAME", COMMITTER_NAME),
+        ("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL),
+    ]
+}
+
 pub struct StagedChange {
     pub status: char,
     pub path: String,
@@ -216,12 +226,7 @@ impl RevisionStore {
                 "-m",
                 message,
             ],
-            &[
-                ("GIT_AUTHOR_NAME", author_name),
-                ("GIT_AUTHOR_EMAIL", author_email),
-                ("GIT_COMMITTER_NAME", COMMITTER_NAME),
-                ("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL),
-            ],
+            &commit_env(Some((author_name, author_email))),
         )?;
         let id = git::run(repo, &["rev-parse", "HEAD"], &[])?;
         Ok(Some(id.trim().to_string()))
@@ -636,9 +641,20 @@ mod tests {
             .commit_batch("A", "a@x.test", "ours", &["note.md".into()])
             .unwrap();
 
-        // Leaves MERGE_HEAD and conflict markers in the working tree.
-        let _ = git::run(dir.path(), &["merge", "other"], &[]);
-        assert!(merge_in_progress(dir.path()));
+        let error = git::run(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Sample",
+                "-c",
+                "user.email=sample@example.test",
+                "merge",
+                "other",
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(merge_in_progress(dir.path()), "merge failed: {error}");
 
         let err = store
             .commit_batch("A", "a@x.test", "should not land", &["note.md".into()])

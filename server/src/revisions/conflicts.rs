@@ -788,16 +788,10 @@ pub fn try_complete_merge(repo: &Path) -> Result<MergeCompletion, SyncError> {
         args.push("--trailer");
         args.push(trailer);
     }
-    let env = authors
+    let author = authors
         .first()
-        .map(|author| {
-            vec![
-                ("GIT_AUTHOR_NAME", author.name.as_str()),
-                ("GIT_AUTHOR_EMAIL", author.email.as_str()),
-            ]
-        })
-        .unwrap_or_default();
-    git::run(repo, &args, &env).map_err(|e| classify(&e))?;
+        .map(|author| (author.name.as_str(), author.email.as_str()));
+    git::run(repo, &args, &super::store::commit_env(author)).map_err(|e| classify(&e))?;
     if let Ok(path) = provenance_path(repo) {
         let _ = std::fs::remove_file(path);
     }
@@ -1115,6 +1109,8 @@ mod tests {
             }),
         )
         .unwrap();
+        git::run(work.path(), &["config", "user.name", ""], &[]).unwrap();
+        git::run(work.path(), &["config", "user.email", ""], &[]).unwrap();
         try_complete_merge(work.path()).unwrap();
         assert_eq!(
             git::run(

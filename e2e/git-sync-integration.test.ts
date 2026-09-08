@@ -46,6 +46,8 @@ test.beforeAll(async () => {
   const space = join(root, "notebook");
   await mkdir(space);
   git(space, "init", "-q", "-b", "main");
+  git(space, "config", "user.name", "");
+  git(space, "config", "user.email", "");
   await writeFile(join(space, "Sample.md"), "Base sentence.\n");
   await writeFile(join(space, "Picture.bin"), Buffer.from("base\0bytes"));
   commit(space, "Initial pages");

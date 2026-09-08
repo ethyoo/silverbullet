@@ -260,7 +260,7 @@ fn tick_once(
         }
         super::conflicts::begin_merge(repo)?;
         args.push("FETCH_HEAD");
-        match git::run(repo, &args, &[]) {
+        match git::run(repo, &args, &super::store::commit_env(None)) {
             Ok(_) => true,
             Err(err) => {
                 let conflicts = unmerged_paths(repo);
@@ -451,6 +451,8 @@ pub(crate) mod tests {
         let (_remote, _seed, work) = conflict_fixture("Added.md", None, b"local\n", b"remote\n");
         std::fs::write(work.path().join("Added.md"), b"combined\n").unwrap();
         std::fs::write(work.path().join("Unrelated.md"), b"still editing\n").unwrap();
+        git::run(work.path(), &["config", "user.name", ""], &[]).unwrap();
+        git::run(work.path(), &["config", "user.email", ""], &[]).unwrap();
         assert_eq!(
             try_complete_merge(work.path()).unwrap(),
             MergeCompletion::Completed
@@ -641,8 +643,17 @@ pub(crate) mod tests {
         git::run(seed.path(), &["push", "-q"], &[]).unwrap();
         commit_file(work.path(), "mine.md", "m\n", "mine");
 
+        git::run(work.path(), &["config", "user.name", ""], &[]).unwrap();
+        git::run(work.path(), &["config", "user.email", ""], &[]).unwrap();
+
         let outcome = tick(work.path(), &[], false).unwrap();
         assert_eq!(outcome, TickOutcome::MergedAndPushed);
+        assert_eq!(
+            git::run(work.path(), &["show", "-s", "--format=%an <%ae>|%cn <%ce>"], &[])
+                .unwrap()
+                .trim(),
+            "SilverBullet <silverbullet@silverbullet.local>|SilverBullet <silverbullet@silverbullet.local>"
+        );
         assert!(work.path().join("theirs.md").exists());
 
         let other = plain_clone(remote.path());
@@ -658,6 +669,9 @@ pub(crate) mod tests {
         commit_file(seed.path(), "note.md", "theirs\n", "theirs");
         git::run(seed.path(), &["push", "-q"], &[]).unwrap();
         commit_file(work.path(), "note.md", "mine\n", "mine");
+
+        git::run(work.path(), &["config", "user.name", ""], &[]).unwrap();
+        git::run(work.path(), &["config", "user.email", ""], &[]).unwrap();
 
         let outcome = tick(work.path(), &[], false).unwrap();
         assert_eq!(
